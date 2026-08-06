@@ -1,0 +1,1058 @@
+{
+  "schemaVersion": "1.0",
+  "metadata": {
+    "name": "Default Enterprise Access / Tier Model",
+    "description": "Three-tier administrative model (Tier 0 control plane, Tier 1 server plane, Tier 2 workstation plane) including OU structure, AGDLP groups, ACL delegation, logon-restriction GPOs and Kerberos Authentication Policy Silos.",
+    "revision": 1
+  },
+  "domain": {
+    "fqdn": null,
+    "rootOu": "Tiering",
+    "rootOuDescription": "Root of the administrative tier model - managed by ADTierKit. Do not edit manually."
+  },
+  "options": {
+    "protectOusFromAccidentalDeletion": true,
+    "blockInheritanceOnTierRoots": false,
+    "blockGpoInheritanceOnTierRoots": true,
+    "createAdminAccounts": true,
+    "adminAccountsDisabledOnCreation": true,
+    "adminAccountsSensitiveNoDelegation": true,
+    "addTier0AdminsToProtectedUsers": true,
+    "enableAdRecycleBin": true,
+    "machineAccountQuota": 0,
+    "redirectComputersTo": "Tier-2/Staging",
+    "redirectUsersTo": null,
+    "enableSiteLinkNotification": true,
+    "deployWindowsLaps": true,
+    "createKdsRootKey": true,
+    "kdsRootKeyEffectiveImmediately": false,
+    "createGpos": true,
+    "restrictedGroupsMode": "MemberOf",
+    "linkGpos": true,
+    "enforceGpoLinks": true,
+    "createAuthenticationPolicySilo": true,
+    "authenticationPolicyEnforcement": "Audit",
+    "tier0TgtLifetimeMinutes": 240
+  },
+  "tiers": [
+    {
+      "id": 0,
+      "name": "Tier-0",
+      "description": "Control plane: domain controllers, AD, PKI, identity and directory synchronisation infrastructure.",
+      "organizationalUnits": [
+        {
+          "name": "Accounts",
+          "description": "Tier 0 administrative user accounts"
+        },
+        {
+          "name": "Groups",
+          "description": "Tier 0 role and access groups"
+        },
+        {
+          "name": "Servers",
+          "description": "Tier 0 servers (PKI, ADFS, Entra Connect, backup of DCs). Domain controllers stay in OU=Domain Controllers."
+        },
+        {
+          "name": "Devices",
+          "description": "Privileged Access Workstations (PAW) used to administer Tier 0"
+        },
+        {
+          "name": "Service-Accounts",
+          "description": "Tier 0 service accounts, gMSA and dMSA"
+        },
+        {
+          "name": "Staging",
+          "description": "Landing zone for newly joined Tier 0 systems before classification"
+        }
+      ],
+      "groups": [
+        {
+          "name": "G-T0-Admins",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 0 administrators (role group). Members administer the control plane."
+        },
+        {
+          "name": "G-T0-Operators",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 0 operators without directory write permissions."
+        },
+        {
+          "name": "DL-T0-LocalAdmins",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Administrators group of Tier 0 systems.",
+          "members": [
+            "G-T0-Admins"
+          ]
+        },
+        {
+          "name": "DL-T0-RemoteDesktop",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Remote Desktop Users group of Tier 0 systems.",
+          "members": [
+            "G-T0-Admins"
+          ]
+        },
+        {
+          "name": "DL-T0-DenyLogon",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Principals that must never authenticate to a Tier 0 system.",
+          "members": [
+            "G-T1-Admins",
+            "G-T1-Operators",
+            "G-T2-Admins",
+            "G-T2-Operators"
+          ]
+        }
+      ],
+      "adminAccounts": [
+        {
+          "samAccountName": "adm-t0-breakglass",
+          "displayName": "Tier 0 Break Glass Account",
+          "targetOu": "Accounts",
+          "memberOf": [
+            "G-T0-Admins"
+          ],
+          "description": "Emergency access account. Keep credential in a sealed envelope, monitor every use.",
+          "excludeFromSilo": true
+        },
+        {
+          "samAccountName": "adm-t0-template",
+          "displayName": "Tier 0 Admin Template",
+          "targetOu": "Accounts",
+          "memberOf": [
+            "G-T0-Admins"
+          ],
+          "description": "Template account - copy this object when onboarding a Tier 0 administrator."
+        }
+      ],
+      "delegations": [
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "user",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete user objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "group",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete group objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete computer objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "organizationalUnit",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete organizationalUnit objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "contact",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete contact objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "msDS-GroupManagedServiceAccount",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete msDS-GroupManagedServiceAccount objects in the Tier-0 branch"
+        },
+        {
+          "principal": "G-T0-Admins",
+          "targetOu": "",
+          "rights": "ReadProperty, WriteProperty, Delete, DeleteTree, ExtendedRight, Self",
+          "objectType": null,
+          "inheritedObjectType": null,
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Manage every object below the Tier-0 branch - permissions on the branch itself stay out of reach"
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Servers",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete Tier-0 computer objects",
+          "inheritedObjectType": null
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Servers",
+          "rights": "ExtendedRight",
+          "objectType": "User-Force-Change-Password",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Reset the computer account password - required to join or rejoin"
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Servers",
+          "rights": "Self",
+          "objectType": "Validated-DNS-Host-Name",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the DNS host name"
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Servers",
+          "rights": "Self",
+          "objectType": "Validated-SPN",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the service principal names"
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Servers",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": "Account-Restrictions",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Account restrictions property set - required to enable the joined account"
+        },
+        {
+          "principal": "G-T0-Operators",
+          "targetOu": "Service-Accounts",
+          "rights": "ReadProperty, ExtendedRight",
+          "objectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Read gMSA password blobs"
+        }
+      ],
+      "gpos": [
+        {
+          "name": "T0-Logon-Restrictions",
+          "targetOu": "",
+          "linkEnabled": true,
+          "comment": "Blocks Tier 1 and Tier 2 principals from authenticating to Tier 0 systems.",
+          "userRights": {
+            "SeDenyInteractiveLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyRemoteInteractiveLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyNetworkLogonRight": [
+              "S-1-5-113",
+              "S-1-5-32-546"
+            ],
+            "SeDenyBatchLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyServiceLogonRight": [
+              "DL-T0-DenyLogon"
+            ]
+          },
+          "allowedUserRights": null,
+          "restrictedGroups": {
+            "S-1-5-32-544": [
+              "DL-T0-LocalAdmins"
+            ],
+            "S-1-5-32-555": [
+              "DL-T0-RemoteDesktop"
+            ]
+          },
+          "registrySettings": [
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+              "valueName": "LocalAccountTokenFilterPolicy",
+              "type": "DWord",
+              "value": 0,
+              "comment": "Keep UAC remote restrictions for local accounts"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\SYSVOL",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for policy retrieval"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\NETLOGON",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for logon script retrieval"
+            },
+            {
+              "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+              "valueName": "RunAsPPL",
+              "type": "DWord",
+              "value": 1,
+              "comment": "LSA protected process"
+            }
+          ],
+          "exceptionGroup": "DL-T0-Exempt-Logon",
+          "exceptionGroupOu": "Groups"
+        },
+        {
+          "name": "T0-DomainController-Baseline",
+          "targetOu": "$DomainControllers",
+          "linkEnabled": true,
+          "comment": "Applies the Tier 0 logon restrictions to the Domain Controllers OU.",
+          "userRights": {
+            "SeDenyInteractiveLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyRemoteInteractiveLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyNetworkLogonRight": [
+              "S-1-5-113",
+              "S-1-5-32-546"
+            ],
+            "SeDenyBatchLogonRight": [
+              "DL-T0-DenyLogon"
+            ],
+            "SeDenyServiceLogonRight": [
+              "DL-T0-DenyLogon"
+            ]
+          },
+          "restrictedGroups": {},
+          "registrySettings": [],
+          "allowedUserRights": {
+            "SeInteractiveLogonRight": [
+              "S-1-5-32-544",
+              "G-T0-Admins"
+            ],
+            "SeRemoteInteractiveLogonRight": [
+              "S-1-5-32-544",
+              "G-T0-Admins"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "Tier-1",
+      "description": "Server and application plane: member servers, business applications, databases.",
+      "organizationalUnits": [
+        {
+          "name": "Accounts",
+          "description": "Tier 1 administrative user accounts"
+        },
+        {
+          "name": "Groups",
+          "description": "Tier 1 role and access groups"
+        },
+        {
+          "name": "Servers",
+          "description": "Tier 1 member servers"
+        },
+        {
+          "name": "Devices",
+          "description": "Administrative workstations / jump hosts for Tier 1"
+        },
+        {
+          "name": "Service-Accounts",
+          "description": "Tier 1 service accounts, gMSA and dMSA"
+        },
+        {
+          "name": "Staging",
+          "description": "Landing zone for newly joined Tier 1 systems"
+        }
+      ],
+      "groups": [
+        {
+          "name": "G-T1-Admins",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 1 server administrators (role group)."
+        },
+        {
+          "name": "G-T1-Operators",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 1 operators, no local administrator rights."
+        },
+        {
+          "name": "DL-T1-LocalAdmins",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Administrators group of Tier 1 servers.",
+          "members": [
+            "G-T1-Admins"
+          ]
+        },
+        {
+          "name": "DL-T1-RemoteDesktop",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Remote Desktop Users group of Tier 1 servers.",
+          "members": [
+            "G-T1-Admins",
+            "G-T1-Operators"
+          ]
+        },
+        {
+          "name": "DL-T1-DenyLogon",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Principals that must never authenticate to a Tier 1 system.",
+          "members": [
+            "G-T0-Admins",
+            "G-T0-Operators",
+            "G-T2-Admins",
+            "G-T2-Operators"
+          ]
+        }
+      ],
+      "adminAccounts": [
+        {
+          "samAccountName": "adm-t1-template",
+          "displayName": "Tier 1 Admin Template",
+          "targetOu": "Accounts",
+          "memberOf": [
+            "G-T1-Admins"
+          ],
+          "description": "Template account - copy this object when onboarding a Tier 1 administrator."
+        }
+      ],
+      "delegations": [
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "user",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete user objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "group",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete group objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete computer objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "organizationalUnit",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete organizationalUnit objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "contact",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete contact objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "msDS-GroupManagedServiceAccount",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete msDS-GroupManagedServiceAccount objects in the Tier-1 branch"
+        },
+        {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "ReadProperty, WriteProperty, Delete, DeleteTree, ExtendedRight, Self",
+          "objectType": null,
+          "inheritedObjectType": null,
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Manage every object below the Tier-1 branch - permissions on the branch itself stay out of reach"
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Servers",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete Tier-1 computer objects",
+          "inheritedObjectType": null
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Servers",
+          "rights": "ExtendedRight",
+          "objectType": "User-Force-Change-Password",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Reset the computer account password - required to join or rejoin"
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Servers",
+          "rights": "Self",
+          "objectType": "Validated-DNS-Host-Name",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the DNS host name"
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Servers",
+          "rights": "Self",
+          "objectType": "Validated-SPN",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the service principal names"
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Servers",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": "Account-Restrictions",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Account restrictions property set - required to enable the joined account"
+        },
+        {
+          "principal": "G-T1-Operators",
+          "targetOu": "Service-Accounts",
+          "rights": "ReadProperty, ExtendedRight",
+          "objectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Read gMSA password blobs"
+        }
+      ],
+      "gpos": [
+        {
+          "name": "T1-Logon-Restrictions",
+          "targetOu": "",
+          "linkEnabled": true,
+          "comment": "Blocks Tier 0 and Tier 2 principals from authenticating to Tier 1 systems.",
+          "userRights": {
+            "SeDenyInteractiveLogonRight": [
+              "DL-T1-DenyLogon"
+            ],
+            "SeDenyRemoteInteractiveLogonRight": [
+              "DL-T1-DenyLogon"
+            ],
+            "SeDenyNetworkLogonRight": [
+              "S-1-5-113",
+              "S-1-5-32-546"
+            ],
+            "SeDenyBatchLogonRight": [
+              "DL-T1-DenyLogon"
+            ],
+            "SeDenyServiceLogonRight": [
+              "DL-T1-DenyLogon"
+            ]
+          },
+          "allowedUserRights": null,
+          "restrictedGroups": {
+            "S-1-5-32-544": [
+              "DL-T1-LocalAdmins"
+            ],
+            "S-1-5-32-555": [
+              "DL-T1-RemoteDesktop"
+            ]
+          },
+          "registrySettings": [
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+              "valueName": "LocalAccountTokenFilterPolicy",
+              "type": "DWord",
+              "value": 0,
+              "comment": "Keep UAC remote restrictions for local accounts"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\SYSVOL",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for policy retrieval"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\NETLOGON",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for logon script retrieval"
+            }
+          ],
+          "exceptionGroup": "DL-T1-Exempt-Logon",
+          "exceptionGroupOu": "Groups"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Tier-2",
+      "description": "Workstation and end user plane: clients, helpdesk, standard users.",
+      "organizationalUnits": [
+        {
+          "name": "Accounts",
+          "description": "Tier 2 administrative user accounts (helpdesk)"
+        },
+        {
+          "name": "Groups",
+          "description": "Tier 2 role and access groups"
+        },
+        {
+          "name": "Devices",
+          "description": "End user workstations"
+        },
+        {
+          "name": "Service-Accounts",
+          "description": "Tier 2 service accounts"
+        },
+        {
+          "name": "Staging",
+          "description": "Landing zone for newly joined workstations"
+        }
+      ],
+      "groups": [
+        {
+          "name": "G-T2-Admins",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 2 workstation administrators (role group)."
+        },
+        {
+          "name": "G-T2-Operators",
+          "scope": "Global",
+          "targetOu": "Groups",
+          "description": "Tier 2 helpdesk operators."
+        },
+        {
+          "name": "DL-T2-LocalAdmins",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Administrators group of Tier 2 workstations.",
+          "members": [
+            "G-T2-Admins"
+          ]
+        },
+        {
+          "name": "DL-T2-RemoteDesktop",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Nested into the local Remote Desktop Users group of Tier 2 workstations.",
+          "members": [
+            "G-T2-Admins",
+            "G-T2-Operators"
+          ]
+        },
+        {
+          "name": "DL-T2-DenyLogon",
+          "scope": "DomainLocal",
+          "targetOu": "Groups",
+          "description": "Principals that must never authenticate to a Tier 2 workstation.",
+          "members": [
+            "G-T0-Admins",
+            "G-T0-Operators",
+            "G-T1-Admins",
+            "G-T1-Operators"
+          ]
+        }
+      ],
+      "adminAccounts": [
+        {
+          "samAccountName": "adm-t2-template",
+          "displayName": "Tier 2 Admin Template",
+          "targetOu": "Accounts",
+          "memberOf": [
+            "G-T2-Admins"
+          ],
+          "description": "Template account - copy this object when onboarding a Tier 2 administrator."
+        }
+      ],
+      "delegations": [
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "user",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete user objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "group",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete group objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete computer objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "organizationalUnit",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete organizationalUnit objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "contact",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete contact objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "msDS-GroupManagedServiceAccount",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete msDS-GroupManagedServiceAccount objects in the Tier-2 branch"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "ReadProperty, WriteProperty, Delete, DeleteTree, ExtendedRight, Self",
+          "objectType": null,
+          "inheritedObjectType": null,
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Manage every object below the Tier-2 branch - permissions on the branch itself stay out of reach"
+        },
+        {
+          "principal": "G-T2-Operators",
+          "targetOu": "Devices",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "computer",
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete Tier-2 computer objects",
+          "inheritedObjectType": null
+        },
+        {
+          "principal": "G-T2-Operators",
+          "targetOu": "Devices",
+          "rights": "ExtendedRight",
+          "objectType": "User-Force-Change-Password",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Reset the computer account password - required to join or rejoin"
+        },
+        {
+          "principal": "G-T2-Operators",
+          "targetOu": "Devices",
+          "rights": "Self",
+          "objectType": "Validated-DNS-Host-Name",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the DNS host name"
+        },
+        {
+          "principal": "G-T2-Operators",
+          "targetOu": "Devices",
+          "rights": "Self",
+          "objectType": "Validated-SPN",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Validated write of the service principal names"
+        },
+        {
+          "principal": "G-T2-Operators",
+          "targetOu": "Devices",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": "Account-Restrictions",
+          "inheritedObjectType": "computer",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Account restrictions property set - required to enable the joined account"
+        }
+      ],
+      "gpos": [
+        {
+          "name": "T2-Logon-Restrictions",
+          "targetOu": "",
+          "linkEnabled": true,
+          "comment": "Blocks Tier 0 and Tier 1 principals from authenticating to Tier 2 workstations.",
+          "userRights": {
+            "SeDenyInteractiveLogonRight": [
+              "DL-T2-DenyLogon"
+            ],
+            "SeDenyRemoteInteractiveLogonRight": [
+              "DL-T2-DenyLogon"
+            ],
+            "SeDenyNetworkLogonRight": [
+              "S-1-5-113",
+              "S-1-5-32-546"
+            ],
+            "SeDenyBatchLogonRight": [
+              "DL-T2-DenyLogon"
+            ],
+            "SeDenyServiceLogonRight": [
+              "DL-T2-DenyLogon"
+            ]
+          },
+          "allowedUserRights": null,
+          "restrictedGroups": {
+            "S-1-5-32-544": [
+              "DL-T2-LocalAdmins"
+            ],
+            "S-1-5-32-555": [
+              "DL-T2-RemoteDesktop"
+            ]
+          },
+          "registrySettings": [
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\SYSVOL",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for policy retrieval"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths",
+              "valueName": "\\\\*\\NETLOGON",
+              "type": "String",
+              "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
+              "comment": "UNC hardened path for logon script retrieval"
+            }
+          ],
+          "exceptionGroup": "DL-T2-Exempt-Logon",
+          "exceptionGroupOu": "Groups"
+        }
+      ]
+    }
+  ],
+  "windowsLaps": {
+    "enabled": true,
+    "updateSchema": true,
+    "policy": {
+      "backupDirectory": 2,
+      "passwordAgeDays": 30,
+      "passwordLength": 24,
+      "passwordComplexity": 4,
+      "administratorAccountName": null,
+      "passwordExpirationProtectionEnabled": 1,
+      "adEncryptedPasswordHistorySize": 12,
+      "postAuthenticationActions": 3,
+      "postAuthenticationResetDelay": 8
+    },
+    "delegations": [
+      {
+        "targetOu": "$DomainControllers",
+        "computerSelfPermission": true,
+        "readGroup": "G-T0-Admins",
+        "resetGroup": "G-T0-Admins",
+        "decryptorGroup": null,
+        "gpoName": null,
+        "comment": "Domain controllers store the DSRM password; its decryptor is always Domain Admins."
+      },
+      {
+        "targetOu": "Tier-0",
+        "computerSelfPermission": true,
+        "readGroup": "G-T0-Admins",
+        "resetGroup": "G-T0-Admins",
+        "decryptorGroup": "G-T0-Admins",
+        "gpoName": "T0-LAPS",
+        "comment": "Local administrator passwords of Tier-0 machines are readable only by G-T0-Admins."
+      },
+      {
+        "targetOu": "Tier-1",
+        "computerSelfPermission": true,
+        "readGroup": "G-T1-Admins",
+        "resetGroup": "G-T1-Admins",
+        "decryptorGroup": "G-T1-Admins",
+        "gpoName": "T1-LAPS",
+        "comment": "Local administrator passwords of Tier-1 machines are readable only by G-T1-Admins."
+      },
+      {
+        "targetOu": "Tier-2",
+        "computerSelfPermission": true,
+        "readGroup": "G-T2-Admins",
+        "resetGroup": "G-T2-Admins",
+        "decryptorGroup": "G-T2-Admins",
+        "gpoName": "T2-LAPS",
+        "comment": "Local administrator passwords of Tier-2 machines are readable only by G-T2-Admins."
+      }
+    ]
+  },
+  "privilegedGroups": {
+    "mode": "Report",
+    "groups": [
+      {
+        "sid": "512",
+        "allowedMembers": [
+          "G-T0-Admins"
+        ],
+        "comment": "Domain Admins - top tier administrators only"
+      },
+      {
+        "sid": "519",
+        "allowedMembers": [],
+        "comment": "Enterprise Admins - empty outside change windows"
+      },
+      {
+        "sid": "518",
+        "allowedMembers": [],
+        "comment": "Schema Admins - empty outside change windows"
+      },
+      {
+        "sid": "526",
+        "allowedMembers": [],
+        "comment": "Key Admins"
+      },
+      {
+        "sid": "S-1-5-32-548",
+        "allowedMembers": [],
+        "comment": "Account Operators - no legitimate use in a tier model"
+      },
+      {
+        "sid": "S-1-5-32-549",
+        "allowedMembers": [],
+        "comment": "Server Operators - grants logon to domain controllers"
+      },
+      {
+        "sid": "S-1-5-32-550",
+        "allowedMembers": [],
+        "comment": "Print Operators - can load drivers on domain controllers"
+      },
+      {
+        "sid": "S-1-5-32-551",
+        "allowedMembers": [],
+        "comment": "Backup Operators - can read the whole directory database"
+      }
+    ]
+  },
+  "auditing": {
+    "enabled": true,
+    "rules": [
+      {
+        "principal": "S-1-1-0",
+        "targetOu": "$ModelRoot",
+        "rights": "CreateChild, DeleteChild, Delete, DeleteTree, WriteProperty, Self, WriteDacl, WriteOwner, ExtendedRight",
+        "flags": "Success",
+        "objectType": null,
+        "inheritance": "All",
+        "comment": "Record every change to the tier model structure and its delegation"
+      },
+      {
+        "principal": "S-1-1-0",
+        "targetOu": "$DomainControllers",
+        "rights": "CreateChild, DeleteChild, Delete, DeleteTree, WriteProperty, Self, WriteDacl, WriteOwner, ExtendedRight",
+        "flags": "Success",
+        "objectType": null,
+        "inheritance": "All",
+        "comment": "Record every change to domain controller objects"
+      }
+    ]
+  },
+  "authenticationPolicySilos": [
+    {
+      "name": "Tier-0-Silo",
+      "policyName": "Tier-0-AuthPolicy",
+      "description": "Restricts Tier-0 accounts to Tier-0 systems using Kerberos armouring.",
+      "memberGroups": [
+        "G-T0-Admins",
+        "G-T0-Operators"
+      ],
+      "memberComputerOus": [
+        "Tier-0/Devices",
+        "Tier-0/Servers"
+      ],
+      "includeDomainControllers": true
+    },
+    {
+      "name": "Tier-1-Silo",
+      "policyName": "Tier-1-AuthPolicy",
+      "description": "Restricts Tier-1 accounts to Tier-1 systems using Kerberos armouring.",
+      "memberGroups": [
+        "G-T1-Admins",
+        "G-T1-Operators"
+      ],
+      "memberComputerOus": [
+        "Tier-1/Devices",
+        "Tier-1/Servers"
+      ],
+      "includeDomainControllers": false
+    }
+  ]
+}
