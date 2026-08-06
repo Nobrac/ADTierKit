@@ -1,0 +1,14 @@
+# Run artefacts - never belong in the repository
+Logs/
+Reports/
+Credentials/
+
+# Backups the tool writes next to the originals
+*.bak-*
+config/*.bak-*
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
