@@ -309,8 +309,9 @@ Deploying tiering in one shot is how people lock themselves out.
 2. **Populate** — move servers, workstations and service accounts into the tier OUs, starting with the **staging** OU of each tier rather than production. Add real administrators to the role groups, and give each admin a separate account per tier they work in.
 3. **Empty the built-in groups** — run `-Stage PrivilegedGroups` in `Report` mode, work through the list, then switch `privilegedGroups.mode` to `Enforce`.
 4. **GPOs in report mode** — link them to the staging OUs first, or link them with the deny groups temporarily emptied, and watch logon failures in the event log.
-5. **Enforce** — populate the deny groups and let the GPOs apply to the full tier OUs.
-6. **Silo enforcement** — flip `authenticationPolicyEnforcement` from `Audit` to `Enforce` only after event IDs 4820 / 4821 have been clean for a few weeks.
+5. **Verify a fresh logon** — with a second session already open, apply the policy, run `gpupdate /force`, and confirm a *new* logon works in a third session before closing the second.
+6. **Enforce** — populate the deny groups and let the GPOs apply to the full tier OUs.
+7. **Silo enforcement** — flip `authenticationPolicyEnforcement` from `Audit` to `Enforce` only after event IDs 4820 / 4821 have been clean for a few weeks.
 
 Keep at least one break-glass account **outside** the silo and outside `Protected Users`. The generated configuration does this via `"excludeFromSilo": true`.
 
@@ -482,9 +483,13 @@ Used anywhere a `targetOu` appears:
 | `gpos[].linkEnabled` | Per GPO: `false` keeps it linked but inactive, and a later deployment respects that instead of switching it back on. |
 | `restrictedGroupsMode` | `MemberOf` (additive) or `Replace` (strict). |
 | `authenticationPolicyEnforcement` | `Audit` or `Enforce`. |
-
-Two choices are **wizard-time, not runtime**: the logon rights mode (`Deny` / `AllowList`) and the delegation model (`Granular` / `FullControl`). They are questions the wizard asks, and their *result* is baked into the configuration — as the `delegations` list and the `allowedUserRights` blocks. Adding a `logonRightsMode` key to the JSON by hand does nothing; to switch, either re-run the wizard or edit those sections directly.
 | `enableAdRecycleBin`, `createKdsRootKey`, `deployWindowsLaps` | Feature switches for the corresponding stages. |
+
+Two choices are **wizard-time, not runtime**: the logon rights mode (`Deny` / `AllowList`) and the
+delegation model (`Granular` / `FullControl`). They are questions the wizard asks, and their
+*result* is baked into the configuration — as the `delegations` list and the `allowedUserRights`
+blocks. Adding a `logonRightsMode` key to the JSON by hand does nothing; to switch, either re-run
+the wizard or edit those sections directly.
 
 ---
 
