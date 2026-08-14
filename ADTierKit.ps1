@@ -39,6 +39,16 @@
     .PARAMETER Force
     Continues even if the prerequisite check reports findings, and skips the safety questions.
 
+    .NOTES
+    Version:  1.0.0
+    License:  MIT
+    Requires: Windows PowerShell 5.1, ActiveDirectory and GroupPolicy modules, Domain Admin.
+
+    Tested against a Windows Server 2025 domain at functional level Windows2025Domain. Written
+    for Windows PowerShell 5.1 specifically - it is what ships on a domain controller, and it is
+    stricter than PowerShell 7 in places that matter (empty collections bound to typed
+    parameters, for one).
+
     .EXAMPLE
     .\ADTierKit.ps1
 
@@ -84,8 +94,8 @@ param(
 
     [string]$ConfigurationPath,
 
-    [ValidateSet('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo')]
-    [string[]]$Stage = @('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo'),
+    [ValidateSet('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'Ownership', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo')]
+    [string[]]$Stage = @('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'Ownership', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo'),
 
     [string]$Server,
 
@@ -134,6 +144,7 @@ Import-Module GroupPolicy -ErrorAction Stop
 #  Logging, configuration loading, runtime context and name resolution.
 ####################################################################################################
 
+$script:TierKitVersion = '1.0.0'
 $script:TierLogFile = $null
 $script:TierActions = [System.Collections.Generic.List[object]]::new()
 $script:TierContext = $null
@@ -157,7 +168,9 @@ function Initialize-TierLog {
     $script:TierLogFile = Join-Path $LogDirectory "ADTierKit-$stamp.log"
     $script:TierActions.Clear()
 
-    Write-TierLog -Message "Log started - $(Get-Date -Format o)" -Level Info
+    # The version goes in the first line of every log and report. A support question that starts
+    # with a pasted log should not also need a question about which build produced it.
+    Write-TierLog -Message "ADTierKit $script:TierKitVersion - log started $(Get-Date -Format o)" -Level Info
     return $script:TierLogFile
 }
 
@@ -256,6 +269,338 @@ function Get-TierActionLog {
     return $script:TierActions.ToArray()
 }
 
+function Add-TierConfigurationItem {
+    <#
+        .SYNOPSIS
+        Appends items to an array property of a configuration object, creating it if absent.
+
+        .DESCRIPTION
+        ConvertFrom-Json produces fixed size arrays, so an in place += is not possible; the
+        property has to be reassigned. A tier that never declared the property at all - a tier
+        with no delegations, say - needs the property added instead.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Property,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Item
+    )
+
+    if ($Item.Count -eq 0) { return }
+
+    if ($Object.PSObject.Properties.Name -contains $Property -and $null -ne $Object.$Property) {
+        $Object.$Property = @(@($Object.$Property | Where-Object { $null -ne $_ }) + $Item)
+    }
+    else {
+        $Object | Add-Member -MemberType NoteProperty -Name $Property -Value ([object[]]$Item) -Force
+    }
+}
+
+function Copy-TierConfigurationObject {
+    <#
+        .SYNOPSIS
+        Deep copies a configuration fragment so a role template can be expanded per tier without
+        the second tier inheriting the first tier's substitutions.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$InputObject)
+    return ($InputObject | ConvertTo-Json -Depth 20 -Compress | ConvertFrom-Json)
+}
+
+function Get-TierToken {
+    <#
+        .SYNOPSIS
+        Returns the short token of a tier ('T0'), used to expand role naming patterns.
+
+        .DESCRIPTION
+        The wizard writes the token it derived from the naming pattern into the tier. A
+        configuration written before roles existed does not have one, so the conventional
+        T<id> is assumed - which is what the shipped naming patterns produce.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Tier)
+
+    if ($Tier.PSObject.Properties.Name -contains 'token' -and $Tier.token) { return [string]$Tier.token }
+    return "T$($Tier.id)"
+}
+
+function Get-TierDenyLogonGroupName {
+    <#
+        .SYNOPSIS
+        Finds the deny logon group of a tier.
+
+        .DESCRIPTION
+        Every role group has to be nested into the deny logon group of every *other* tier, or the
+        role silently becomes a hole in the tier boundary. Which group that is depends on the
+        naming pattern chosen in the wizard, so it is either declared explicitly on the tier or
+        recognised by name.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Tier)
+
+    if ($Tier.PSObject.Properties.Name -contains 'denyLogonGroup' -and $Tier.denyLogonGroup) {
+        return [string]$Tier.denyLogonGroup
+    }
+
+    $candidates = @($Tier.groups | Where-Object { $_.name -match 'Deny[-_ ]?Logon' })
+    if ($candidates.Count -eq 1) { return [string]$candidates[0].name }
+    return $null
+}
+
+function Get-TierSiloDefinition {
+    <#
+        .SYNOPSIS
+        Finds the authentication policy silo belonging to a tier, if one is configured.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Configuration,
+        [Parameter(Mandatory)][object]$Tier
+    )
+
+    $silos = @($Configuration.authenticationPolicySilos | Where-Object { $_ })
+    if (-not $silos) { return $null }
+
+    if ($Tier.PSObject.Properties.Name -contains 'siloName' -and $Tier.siloName) {
+        return ($silos | Where-Object { $_.name -eq $Tier.siloName } | Select-Object -First 1)
+    }
+    return ($silos | Where-Object { $_.name -like "$($Tier.name)*" } | Select-Object -First 1)
+}
+
+function Expand-TierRoleDefinition {
+    <#
+        .SYNOPSIS
+        Expands the 'roles' block into the groups, accounts, delegations, deny nesting and silo
+        membership that a role consists of.
+
+        .DESCRIPTION
+        A role is not one object. A DNS administration role is a global group, a disabled template
+        account, a set of ACEs, a membership in the deny logon group of every other tier, and a
+        membership in the tier's authentication silo. Four of those five are easy to forget when
+        adding a role group by hand - and forgetting the deny nesting means the new group can log
+        on to every tier, which is exactly the boundary the model exists to draw.
+
+        Expansion therefore produces all of them from one declaration, and produces nothing at all
+        if the declaration is incomplete. Everything it generates is ordinary configuration, so
+        the deploy, audit and sync stages need no knowledge of roles whatsoever.
+
+        Expansion is idempotent against a configuration that already contains the generated names,
+        so a role can be added to a configuration the wizard wrote earlier.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Configuration)
+
+    if (-not ($Configuration.PSObject.Properties.Name -contains 'roles')) { return $Configuration }
+    $roles = @($Configuration.roles | Where-Object { $_ })
+    if (-not $roles) { return $Configuration }
+
+    $generated = 0
+
+    foreach ($role in $roles) {
+        if ($role.PSObject.Properties.Name -contains 'enabled' -and -not $role.enabled) {
+            Write-TierLog -Message "Role '$($role.name)' is disabled in the configuration - skipped" -Level Skip
+            continue
+        }
+        if (-not $role.name) { throw 'A role in the configuration has no name.' }
+        if (-not $role.roleGroup) { throw "Role '$($role.name)' has no roleGroup pattern." }
+
+        # .Count, not -not: a role that applies to tier 0 alone declares @(0), which unrolls to a
+        # single 0 and is falsy. Every Tier 0 role in the shipped configuration would have thrown.
+        $roleTiers = @($role.tiers)
+        if ($roleTiers.Count -eq 0) { throw "Role '$($role.name)' does not declare which tiers it applies to." }
+
+        foreach ($tier in $Configuration.tiers) {
+            if ($roleTiers -notcontains $tier.id) { continue }
+
+            $token = Get-TierToken -Tier $tier
+            $tokens = @{
+                ID      = $tier.id
+                TIER    = $tier.name
+                TOKEN   = $token
+                TOKENLC = $token.ToLowerInvariant()
+                ROLE    = $role.name
+                ROLELC  = $role.name.ToLowerInvariant()
+            }
+
+            $groupName = Expand-TierName -Pattern $role.roleGroup -Tokens $tokens
+
+            # --- the role group -------------------------------------------------------------
+            if (@($tier.groups | Where-Object { $_.name -eq $groupName })) {
+                Write-TierLog -Message "Role group $groupName already declared in $($tier.name) - expansion skipped" -Level Skip
+            }
+            else {
+                $description = if ($role.description) { Expand-TierName -Pattern $role.description -Tokens $tokens }
+                else { "$($role.name) administration role for $($tier.name)." }
+
+                $groupOu = if ($role.roleGroupOu) { $role.roleGroupOu } else { 'Groups' }
+                Add-TierConfigurationItem -Object $tier -Property 'groups' -Item @([pscustomobject]@{
+                        name        = $groupName
+                        scope       = 'Global'
+                        targetOu    = $groupOu
+                        description = $description
+                    })
+                $generated++
+            }
+
+            # --- deny logon nesting in every other tier -------------------------------------
+            # The default is on. A role that is exempt has to say so explicitly, because the
+            # failure mode of forgetting is silent and the failure mode of over-denying is loud.
+            $nest = $true
+            if ($role.PSObject.Properties.Name -contains 'nestIntoForeignDenyGroups' -and $null -ne $role.nestIntoForeignDenyGroups) {
+                $nest = [bool]$role.nestIntoForeignDenyGroups
+            }
+
+            if ($nest) {
+                foreach ($other in $Configuration.tiers) {
+                    if ($other.id -eq $tier.id) { continue }
+                    $denyGroupName = Get-TierDenyLogonGroupName -Tier $other
+                    if (-not $denyGroupName) {
+                        Write-TierLog -Message "No deny logon group found for $($other.name) - $groupName is NOT denied there. Declare 'denyLogonGroup' on the tier." -Level Warning
+                        continue
+                    }
+                    $denyGroup = @($other.groups | Where-Object { $_.name -eq $denyGroupName }) | Select-Object -First 1
+                    if (-not $denyGroup) { continue }
+                    if (@($denyGroup.members) -contains $groupName) { continue }
+                    Add-TierConfigurationItem -Object $denyGroup -Property 'members' -Item @($groupName)
+                }
+            }
+            else {
+                Write-TierLog -Message "Role $groupName is exempt from cross-tier deny nesting by configuration" -Level Warning
+            }
+
+            # --- silo membership ------------------------------------------------------------
+            $silo = $null
+            $wantSilo = $true
+            if ($role.PSObject.Properties.Name -contains 'siloMember' -and $null -ne $role.siloMember) {
+                $wantSilo = [bool]$role.siloMember
+            }
+            if ($wantSilo) {
+                $silo = Get-TierSiloDefinition -Configuration $Configuration -Tier $tier
+                if ($silo -and (@($silo.memberGroups) -notcontains $groupName)) {
+                    Add-TierConfigurationItem -Object $silo -Property 'memberGroups' -Item @($groupName)
+                }
+            }
+
+            # --- template account -----------------------------------------------------------
+            if ($role.templateAccount) {
+                $accountName = Expand-TierName -Pattern $role.templateAccount -Tokens $tokens
+                if (-not @($tier.adminAccounts | Where-Object { $_.samAccountName -eq $accountName })) {
+                    Add-TierConfigurationItem -Object $tier -Property 'adminAccounts' -Item @([pscustomobject]@{
+                            samAccountName = $accountName
+                            displayName    = "$($tier.name) $($role.name) Admin Template"
+                            targetOu       = 'Accounts'
+                            memberOf       = @($groupName)
+                            description    = "Template account - copy this object when onboarding a $($role.name) administrator for $($tier.name)."
+                        })
+                    $generated++
+                }
+            }
+
+            # --- delegations ----------------------------------------------------------------
+            foreach ($delegation in @($role.delegations | Where-Object { $_ })) {
+                $copy = Copy-TierConfigurationObject -InputObject $delegation
+
+                # A role delegation normally targets its own role group; naming it explicitly
+                # stays possible for the rare ACE that has to name something else.
+                if (-not ($copy.PSObject.Properties.Name -contains 'principal') -or -not $copy.principal) {
+                    $copy | Add-Member -MemberType NoteProperty -Name 'principal' -Value $groupName -Force
+                }
+                else {
+                    $copy.principal = Expand-TierName -Pattern $copy.principal -Tokens $tokens
+                }
+
+                foreach ($field in 'targetOu', 'comment') {
+                    if ($copy.PSObject.Properties.Name -contains $field -and $copy.$field) {
+                        $copy.$field = Expand-TierName -Pattern $copy.$field -Tokens $tokens
+                    }
+                }
+                if (-not ($copy.PSObject.Properties.Name -contains 'inheritedObjectType')) {
+                    $copy | Add-Member -MemberType NoteProperty -Name 'inheritedObjectType' -Value $null -Force
+                }
+
+                Add-TierConfigurationItem -Object $tier -Property 'delegations' -Item @($copy)
+                $generated++
+            }
+
+            # --- built-in group nesting -----------------------------------------------------
+            # DnsAdmins and Group Policy Creator Owners already hold the permissions the role
+            # needs. Nesting into them and keeping the built-in group otherwise empty is the
+            # documented way to hold those permissions without handing anyone the group itself.
+            #
+            # Two things are generated per entry, and they are not the same thing: a declaration
+            # in privilegedGroups, which is what watches the group for undeclared members, and an
+            # entry in builtInNesting, which is what actually performs the nesting. Without the
+            # second one the role holds no permissions at all until somebody switches
+            # privilegedGroups to Enforce, because report mode reports an absent member rather
+            # than adding it.
+            foreach ($builtIn in @($role.privilegedGroupNesting | Where-Object { $_ })) {
+                $reference = if ($builtIn -is [string]) { [pscustomobject]@{ name = $builtIn } } else { $builtIn }
+                $key = if ($reference.PSObject.Properties.Name -contains 'sid' -and $reference.sid) { $reference.sid } else { $reference.name }
+
+                # A built-in group of this kind is Tier 0 by capability whatever its RID says:
+                # DnsAdmins members can load a DLL into a service running as SYSTEM on a domain
+                # controller. Nesting a lower tier role into one would hand that tier the control
+                # plane, which is the boundary this whole model exists to draw - so it is refused
+                # rather than warned about.
+                if ($tier.id -ne @($Configuration.tiers)[0].id) {
+                    Write-TierLog -Message "Role '$($role.name)' in $($tier.name) declares nesting into the privileged built-in group '$key' - refused. Only the top tier may hold it." -Level Error
+                    Add-TierAction -Phase 'Role' -ObjectType 'PrivilegedGroup' -Target "$groupName -> $key" -Result 'Failed' `
+                        -Detail 'A role below the top tier may not be nested into a privileged built-in group' -Severity 'High'
+                    continue
+                }
+
+                if ($Configuration.privilegedGroups) {
+                    $entry = @($Configuration.privilegedGroups.groups | Where-Object {
+                            ($_.PSObject.Properties.Name -contains 'sid' -and $_.sid -eq $key) -or
+                            ($_.PSObject.Properties.Name -contains 'name' -and $_.name -eq $key)
+                        }) | Select-Object -First 1
+
+                    if ($entry) {
+                        if (@($entry.allowedMembers) -notcontains $groupName) {
+                            Add-TierConfigurationItem -Object $entry -Property 'allowedMembers' -Item @($groupName)
+                        }
+                    }
+                    else {
+                        $new = [pscustomobject]@{
+                            sid            = if ($reference.PSObject.Properties.Name -contains 'sid') { $reference.sid } else { $null }
+                            name           = if ($reference.PSObject.Properties.Name -contains 'name') { $reference.name } else { $null }
+                            allowedMembers = @($groupName)
+                            comment        = "Holds the permissions of the $($role.name) role - members are nested, never added directly."
+                        }
+                        Add-TierConfigurationItem -Object $Configuration.privilegedGroups -Property 'groups' -Item @($new)
+                    }
+                }
+
+                $existingNesting = @($Configuration.builtInNesting | Where-Object {
+                        $_ -and (
+                            ($_.group.PSObject.Properties.Name -contains 'sid' -and $_.group.sid -eq $key) -or
+                            ($_.group.PSObject.Properties.Name -contains 'name' -and $_.group.name -eq $key)
+                        )
+                    }) | Select-Object -First 1
+
+                if ($existingNesting) {
+                    if (@($existingNesting.members) -notcontains $groupName) {
+                        Add-TierConfigurationItem -Object $existingNesting -Property 'members' -Item @($groupName)
+                    }
+                }
+                else {
+                    Add-TierConfigurationItem -Object $Configuration -Property 'builtInNesting' -Item @([pscustomobject]@{
+                            group   = $reference
+                            members = @($groupName)
+                            comment = "Grants the $($role.name) role the permissions this built-in group already holds."
+                        })
+                }
+                $generated++
+            }
+        }
+    }
+
+    if ($generated -gt 0) {
+        Write-TierLog -Message "Role expansion produced $generated additional configuration object(s)" -Level Info
+    }
+    return $Configuration
+}
+
 function Import-TierConfiguration {
     <#
         .SYNOPSIS
@@ -286,6 +631,11 @@ function Import-TierConfiguration {
     if ($config.tiers.Count -eq 0) {
         throw 'Configuration contains no tiers.'
     }
+
+    # Roles expand into ordinary groups, accounts, delegations, deny nesting and silo membership
+    # before anything else looks at the configuration, so every existing stage keeps working
+    # unchanged and the duplicate check below covers generated names too.
+    $config = Expand-TierRoleDefinition -Configuration $config
 
     $names = @{}
     foreach ($tier in $config.tiers) {
@@ -325,6 +675,13 @@ function Initialize-TierContext {
     $rootOuName = $Configuration.domain.rootOu
     $rootDn = "OU=$rootOuName,$($domain.DistinguishedName)"
 
+    # The forest root domain naming context, needed for the ForestDnsZones partition. Deriving it
+    # from the forest FQDN avoids a second directory round trip and is correct for every domain
+    # whose DN follows its DNS name - which, outside of renamed domains, is all of them.
+    $forestDn = ($domain.Forest -split '\.' | ForEach-Object { "DC=$_" }) -join ','
+
+    $systemDn = "CN=System,$($domain.DistinguishedName)"
+
     $script:TierContext = [pscustomobject]@{
         Domain           = $domain
         DomainDn         = $domain.DistinguishedName
@@ -335,6 +692,15 @@ function Initialize-TierContext {
         RootOuName       = $rootOuName
         RootOuDn         = $rootDn
         DomainControllersDn = $domain.DomainControllersContainer
+        # Containers outside the tier model that delegation still has to reach. They are built
+        # here rather than in the configuration because none of them can be named portably: every
+        # one carries the domain DN, and two of them live in application partitions.
+        SystemContainerDn   = $systemDn
+        MicrosoftDnsDn      = "CN=MicrosoftDNS,$systemDn"
+        DomainDnsZonesDn    = "CN=MicrosoftDNS,DC=DomainDnsZones,$($domain.DistinguishedName)"
+        ForestDnsZonesDn    = "CN=MicrosoftDNS,DC=ForestDnsZones,$forestDn"
+        PoliciesDn          = "CN=Policies,$systemDn"
+        AdminSdHolderDn     = "CN=AdminSDHolder,$systemDn"
         SysvolPolicyPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies"
         Configuration    = $Configuration
         # Lets a bare tier name be resolved as an OU reference without a tier context.
@@ -378,6 +744,13 @@ function Resolve-TierOuDn {
           'Tier-1/Servers'      -> an explicit tier path below the model root
           '$DomainRoot'         -> the domain naming context
           '$DomainControllers'  -> the Domain Controllers container
+          '$SystemContainer'    -> CN=System,<domain>
+          '$MicrosoftDns'       -> CN=MicrosoftDNS,CN=System,<domain>  (DNS server object)
+          '$DomainDnsZones'     -> the domain DNS application partition
+          '$ForestDnsZones'     -> the forest DNS application partition
+          '$PoliciesContainer'  -> CN=Policies,CN=System,<domain>      (group policy objects)
+          '$AdminSDHolder'      -> CN=AdminSDHolder,CN=System,<domain>
+          '$DnsZone:contoso.com'-> that zone inside the domain DNS partition
           'OU=X,DC=...'         -> passed through unchanged
     #>
     [CmdletBinding()]
@@ -397,6 +770,21 @@ function Resolve-TierOuDn {
         '$DomainRoot' { return $ctx.DomainDn }
         '$DomainControllers' { return $ctx.DomainControllersDn }
         '$ModelRoot' { return $ctx.RootOuDn }
+        '$SystemContainer' { return $ctx.SystemContainerDn }
+        '$MicrosoftDns' { return $ctx.MicrosoftDnsDn }
+        '$DomainDnsZones' { return $ctx.DomainDnsZonesDn }
+        '$ForestDnsZones' { return $ctx.ForestDnsZonesDn }
+        '$PoliciesContainer' { return $ctx.PoliciesDn }
+        '$AdminSDHolder' { return $ctx.AdminSdHolderDn }
+    }
+
+    # A single zone, for record level delegation. Zones created since Windows Server 2003 live in
+    # the application partition; a zone predating it sits under CN=MicrosoftDNS,CN=System instead,
+    # in which case the full DN has to be written out in the configuration.
+    if ($Reference -match '^\$DnsZone:(.+)$') {
+        $zoneName = $Matches[1].Trim()
+        if (-not $zoneName) { throw 'OU reference "$DnsZone:" is missing the zone name.' }
+        return "DC=$zoneName,$($ctx.DomainDnsZonesDn)"
     }
 
     if ($Reference -match '^(OU|CN|DC)=') { return $Reference }
@@ -436,9 +824,15 @@ function Resolve-TierPrincipal {
 
     try {
         if ($Reference -match '^S-1-') {
+            # By LDAP filter, not -Identity: Get-ADObject binds -Identity to a distinguished name
+            # or a GUID and rejects a SID outright, which surfaces as an unresolvable principal
+            # several frames later rather than as an error anyone can act on.
             $obj = $null
-            try { $obj = Get-ADObject -Identity $Reference -Properties objectSid, sAMAccountName @ad -ErrorAction Stop }
-            catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] { $obj = $null }
+            try {
+                $obj = Get-ADObject -LDAPFilter "(objectSid=$Reference)" -Properties objectSid, sAMAccountName @ad -ErrorAction Stop |
+                    Select-Object -First 1
+            }
+            catch { $obj = $null }
             if (-not $obj) {
                 # Well-known SIDs (e.g. S-1-5-113 Local account) have no directory object.
                 return [pscustomobject]@{
@@ -484,6 +878,59 @@ function Resolve-TierPrincipal {
         if ($AllowMissing) { return $null }
         throw
     }
+}
+
+function New-TierSecurityIdentifier {
+    <#
+        .SYNOPSIS
+        Builds a SecurityIdentifier from a SID string.
+
+        .DESCRIPTION
+        One line, wrapped in a function on purpose. Owner assignment is the one part of this tool
+        whose logic cannot be exercised outside Windows - the SecurityIdentifier constructor is
+        not implemented on other platforms - and routing every construction through one seam lets
+        the offline tests reach the code around it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Sid)
+    return [System.Security.Principal.SecurityIdentifier]::new($Sid)
+}
+
+function Resolve-TierPrincipalReference {
+    <#
+        .SYNOPSIS
+        Resolves a principal reference that may also be a bare domain relative identifier.
+
+        .DESCRIPTION
+        The privileged group block addresses groups by RID ('512' for Domain Admins), because
+        their names are localised. Anywhere a configuration names a principal that is likely to be
+        one of those built-in groups - the owner of an object, for instance - the same shorthand
+        has to work, and Resolve-TierPrincipal on its own would go looking for a group whose
+        sAMAccountName is literally '512'.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Reference,
+        [switch]$AllowMissing
+    )
+
+    if ($Reference -match '^\d+$') {
+        # No -Properties here: only the name, SID and DN are used below, and an empty property
+        # set is not a valid argument to Get-ADGroup on Windows PowerShell 5.1.
+        $group = Get-TierWellKnownGroup -Sid $Reference
+        if (-not $group) {
+            if ($AllowMissing) { return $null }
+            throw "No group with RID $Reference exists in this domain."
+        }
+        return [pscustomobject]@{
+            Name              = $group.Name
+            SID               = $group.SID.Value
+            DistinguishedName = $group.DistinguishedName
+            IsWellKnown       = $false
+        }
+    }
+
+    return (Resolve-TierPrincipal -Reference $Reference -AllowMissing:$AllowMissing)
 }
 
 function Clear-TierPrincipalCache {
@@ -576,8 +1023,50 @@ function Get-TierWellKnownGroup {
     $ad = Get-TierAdParameter
     $full = if ($Sid -match '^S-1-') { $Sid } else { "$($ctx.DomainSid)-$Sid" }
 
+    # An empty collection is a reasonable way to say 'no extra attributes', and Get-ADGroup rejects
+    # it - on Windows PowerShell 5.1 the binding fails at the call site, several frames away from
+    # the cmdlet that actually objects. Normalising it here keeps that from being anybody's
+    # problem twice.
+    if (-not $Properties -or @($Properties).Count -eq 0) { $Properties = @('objectSid') }
+
     try { return Get-ADGroup -Identity $full -Properties $Properties @ad -ErrorAction Stop }
     catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] { return $null }
+}
+
+function Get-TierPrivilegedGroupReference {
+    <#
+        .SYNOPSIS
+        Resolves a privileged group entry that is addressed either by SID or by name.
+
+        .DESCRIPTION
+        Everything privileged in this tool is addressed by SID, because built-in group names are
+        localised. Two groups cannot be: DnsAdmins and DnsUpdateProxy are created by the DNS
+        server role, not by the operating system, and receive an ordinary RID above 1000 that
+        differs between domains. They are also not localised, which is what makes the name lookup
+        safe here and nowhere else.
+
+        DnsAdmins is worth the exception. It is not covered by AdminSDHolder and carries no
+        adminCount, so nothing flags it as privileged - but its members can load a DLL into the
+        DNS service, which runs as SYSTEM on a domain controller. It is Tier 0 in everything but
+        Microsoft's classification of it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [string[]]$Properties = @('member')
+    )
+
+    if ($Entry.PSObject.Properties.Name -contains 'sid' -and $Entry.sid) {
+        return Get-TierWellKnownGroup -Sid $Entry.sid -Properties $Properties
+    }
+
+    if (-not ($Entry.PSObject.Properties.Name -contains 'name') -or -not $Entry.name) {
+        throw 'A privileged group entry declares neither a sid nor a name.'
+    }
+
+    $ad = Get-TierAdParameter
+    return (Get-ADGroup -LDAPFilter "(sAMAccountName=$($Entry.name))" -Properties $Properties @ad -ErrorAction SilentlyContinue |
+        Select-Object -First 1)
 }
 
 function ConvertTo-TierSidString {
@@ -1325,6 +1814,236 @@ function Set-TierGpoRegistrySetting {
     return 'Planned'
 }
 
+function Set-TierDirectoryOwner {
+    <#
+        .SYNOPSIS
+        Writes the owner of a directory object and confirms that it took.
+
+        .DESCRIPTION
+        Owner assignment does not go through Set-ADObject. Replacing nTSecurityDescriptor there
+        writes the DACL and drops the owner portion without raising anything - the call succeeds,
+        the owner is unchanged, and any code that trusts the return value reports a correction
+        that never happened. The owner sits behind its own security mask, and the cmdlet does not
+        set it.
+
+        Set-Acl on the AD provider does. The DirectoryEntry route that would set the mask by hand
+        was measured against a Server 2025 domain controller and does not work from Windows
+        PowerShell 5.1 - DirectoryEntryConfiguration comes back null even after the entry is
+        bound, so the mask can never be set and the owner is left untouched.
+
+        The write is read back afterwards, always. A write the directory accepts without applying
+        is the failure mode this function exists for, and it must not be possible to report a
+        correction without having looked.
+
+        .OUTPUTS
+        $true when the owner is confirmed changed. Throws when the write did not take effect.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Dn,
+        [Parameter(Mandatory)][string]$OwnerSid
+    )
+
+    $ctx = Get-TierContext
+    $sid = New-TierSecurityIdentifier -Sid $OwnerSid
+
+    # The write has to land on the same domain controller the rest of the run reads from. The AD:
+    # drive is bound to whichever server the session picked, so when -Server names a different
+    # one, a temporary drive is used instead: otherwise the write goes to one DC, the read-back
+    # queries another, and replication latency turns into a failure that is not one.
+    $drive = $null
+    $prefix = 'AD:'
+    if ($ctx.Server) {
+        $name = "TierOwner$PID"
+        try {
+            $drive = New-PSDrive -Name $name -PSProvider ActiveDirectory -Server $ctx.Server -Root '//RootDSE/' -Scope Script -ErrorAction Stop
+            $prefix = "${name}:"
+        }
+        catch {
+            Write-TierLog -Message "Could not bind a directory drive to $($ctx.Server) - falling back to the session default for the owner write" -Level Warning
+        }
+    }
+
+    try {
+        $acl = Get-Acl -Path "$prefix$Dn" -ErrorAction Stop
+        $acl.SetOwner($sid)
+        Set-Acl -Path "$prefix$Dn" -AclObject $acl -ErrorAction Stop
+    }
+    finally {
+        if ($drive) { Remove-PSDrive -Name $drive.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    if (Test-TierObjectOwner -Dn $Dn -OwnerSid $OwnerSid) { return $true }
+
+    throw "The owner of $Dn is unchanged after the write - the directory accepted the change without applying it."
+}
+
+function Test-TierObjectOwner {
+    <#
+        .SYNOPSIS
+        Reads back the owner of an object and reports whether it matches.
+
+        .DESCRIPTION
+        Separate from the write on purpose. A write that the directory accepts without applying
+        is the failure this code exists to catch, so the check has to be a real round trip to the
+        directory rather than the return value of the call that just claimed to have done it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Dn,
+        [Parameter(Mandatory)][string]$OwnerSid
+    )
+
+    $ad = Get-TierAdParameter
+    try {
+        $object = Get-ADObject -Identity $Dn -Properties nTSecurityDescriptor @ad -ErrorAction Stop
+        $owner = $object.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier])
+        return ($owner -and $owner.Value -eq $OwnerSid)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Set-TierGpoOwner {
+    <#
+        .SYNOPSIS
+        Ensures a policy object is owned by the declared principal rather than by whoever created
+        it.
+
+        .OUTPUTS
+        'Created', 'Compliant', 'Missing' or 'Planned'
+
+        .DESCRIPTION
+        An owner holds WRITE_DAC implicitly, whatever the DACL says. A policy created by a
+        delegated administrator is therefore permanently re-permissionable by that administrator,
+        which quietly undoes any granular delegation placed on it afterwards. Objects created by a
+        member of Domain Admins get Domain Admins as owner; everything else gets its creator, so
+        this only has work to do where delegation is actually in use.
+
+        The SYSVOL side of the same problem is not addressed here - the file system ACL of the
+        policy folder has its own owner, and changing it needs SeRestorePrivilege on the share.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][string]$GpoDn,
+        [Parameter(Mandatory)][string]$OwnerSid,
+        [switch]$AuditOnly
+    )
+
+    $ad = Get-TierAdParameter
+
+    $object = $null
+    try { $object = Get-ADObject -Identity $GpoDn -Properties nTSecurityDescriptor @ad -ErrorAction Stop }
+    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+        if ($AuditOnly) { return 'Missing' }
+        if ($WhatIfPreference) { return 'Planned' }
+        throw
+    }
+
+    $sd = $object.nTSecurityDescriptor
+    $current = $sd.GetOwner([System.Security.Principal.SecurityIdentifier])
+    if ($current -and $current.Value -eq $OwnerSid) { return 'Compliant' }
+
+    if ($AuditOnly) { return 'Missing' }
+
+    if ($PSCmdlet.ShouldProcess($GpoDn, "Set owner to SID $OwnerSid")) {
+        Set-TierDirectoryOwner -Dn $GpoDn -OwnerSid $OwnerSid | Out-Null
+        return 'Created'
+    }
+
+    return 'Planned'
+}
+
+function Set-TierGpoDelegation {
+    <#
+        .SYNOPSIS
+        Applies the per-GPO permission delegation declared in the configuration.
+
+        .DESCRIPTION
+        Editing rights are granted through the GroupPolicy module rather than by writing ACEs,
+        because a policy object carries permissions in two places - the directory object and the
+        SYSVOL folder - and Set-GPPermission keeps both consistent.
+
+        'GpoEdit' is as granular as this gets, and it is not granular enough: it maps to write
+        access on all properties, which includes displayName and gPCWQLFilter. A delegate can
+        therefore rename the policy and change its WMI filter, and changing the filter changes
+        which machines the policy applies to. The narrower alternative - write access to
+        versionNumber and the two extension name attributes only - is refused by the GPMC, which
+        will not open a policy it cannot fully write. Auditing displayName and gPCWQLFilter is the
+        available mitigation; see the auditing section of the configuration.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object]$Gpo,
+        [Parameter(Mandatory)][object]$Delegation,
+        [switch]$AuditOnly
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    $levels = [ordered]@{
+        editors = 'GpoEdit'
+        readers = 'GpoRead'
+    }
+
+    foreach ($field in $levels.Keys) {
+        if (-not ($Delegation.PSObject.Properties.Name -contains $field)) { continue }
+
+        foreach ($reference in @($Delegation.$field | Where-Object { $_ })) {
+            $principal = Resolve-TierPrincipal -Reference $reference -AllowMissing
+            if (-not $principal) {
+                $results.Add([pscustomobject]@{ Target = "$reference on $($Gpo.DisplayName)"; Result = if ($WhatIfPreference) { 'Planned' } else { 'Missing' } })
+                continue
+            }
+
+            $wanted = $levels[$field]
+            $current = $null
+            try {
+                $current = Get-GPPermission -Guid $Gpo.Id -TargetName $principal.Name -TargetType Group -ErrorAction SilentlyContinue
+            }
+            catch {
+                # Get-GPPermission throws rather than returning nothing when the trustee holds no
+                # permission at all, which is the normal case on first deployment.
+                $current = $null
+            }
+
+            # GpoEditDeleteModifySecurity is a superset of GpoEdit; treating it as drift would
+            # fight with a deliberate grant made outside the tool.
+            $satisfied = $current -and (
+                $current.Permission -eq $wanted -or
+                ($wanted -eq 'GpoEdit' -and $current.Permission -eq 'GpoEditDeleteModifySecurity') -or
+                ($wanted -eq 'GpoRead' -and $current.Permission -in @('GpoEdit', 'GpoApply', 'GpoEditDeleteModifySecurity'))
+            )
+
+            if ($satisfied) {
+                $results.Add([pscustomobject]@{ Target = "$reference $wanted on $($Gpo.DisplayName)"; Result = 'Compliant' })
+                continue
+            }
+
+            if ($AuditOnly) {
+                $results.Add([pscustomobject]@{ Target = "$reference $wanted on $($Gpo.DisplayName)"; Result = 'Missing' })
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($Gpo.DisplayName, "Grant $wanted to $reference")) {
+                try {
+                    Set-GPPermission -Guid $Gpo.Id -TargetName $principal.Name -TargetType Group -PermissionLevel $wanted -ErrorAction Stop | Out-Null
+                    $results.Add([pscustomobject]@{ Target = "$reference $wanted on $($Gpo.DisplayName)"; Result = 'Created' })
+                }
+                catch {
+                    $results.Add([pscustomobject]@{ Target = "$reference $wanted on $($Gpo.DisplayName)"; Result = 'Failed'; Detail = $_.Exception.Message })
+                }
+            }
+            else {
+                $results.Add([pscustomobject]@{ Target = "$reference $wanted on $($Gpo.DisplayName)"; Result = 'Planned' })
+            }
+        }
+    }
+
+    return $results
+}
+
 function Set-TierGpoLink {
     <#
         .SYNOPSIS
@@ -1696,6 +2415,12 @@ function New-TierModelConfiguration {
         $tiers += [ordered]@{
             id                  = $meta.Id
             name                = $meta.Name
+            # The token and the deny logon group are written out because role expansion needs
+            # both and neither can be derived from the tier name once a custom naming pattern is
+            # in play. Guessing them would put a role group in the wrong deny group, which is a
+            # hole rather than an error message.
+            token               = $meta.Token
+            denyLogonGroup      = $meta.DenyLogon
             description         = $description
             organizationalUnits = $ous.ToArray()
             groups              = $groups
@@ -1791,6 +2516,28 @@ function New-TierModelConfiguration {
         }
         options       = $defaultOptions
         tiers         = $tiers
+        # Roles expand into groups, template accounts, delegations, cross-tier deny nesting and
+        # silo membership at load time. The wizard writes the key empty rather than omitting it,
+        # because a key that is present in the file is one somebody will read the comment on.
+        # config/roles.example.json holds ready-made DNS and Group Policy roles.
+        roles         = @()
+        # Generated by role expansion at load time. Present and empty so that a hand-written entry
+        # has somewhere obvious to go: it nests a group into a built-in group such as DnsAdmins,
+        # additively, and never removes anything.
+        builtInNesting = @()
+        # An owner holds WRITE_DAC implicitly, so an object owned by a delegated administrator is
+        # one whose permissions that administrator can rewrite. Report mode by default: the first
+        # run after a rollout finds nothing, and what it finds later is worth reading before it is
+        # corrected automatically.
+        ownership     = [ordered]@{
+            enabled          = $true
+            mode             = 'Report'
+            owner            = '512'
+            acceptableOwners = @()
+            scopes           = @('$ModelRoot')
+            objectClasses    = @('user', 'group', 'computer', 'organizationalUnit', 'msDS-GroupManagedServiceAccount')
+            maxObjects       = 5000
+        }
         windowsLaps = [ordered]@{
             enabled      = [bool]$defaultOptions['deployWindowsLaps']
             updateSchema = $true
@@ -2174,9 +2921,136 @@ function Set-TierGroupNesting {
         }
     }
 
+    # Built-in groups are nested from the same stage, so Deploy, Sync and Audit all cover them
+    # without a new stage name and without a new place to forget.
+    Set-TierBuiltInGroupNesting -Configuration $Configuration -AuditOnly:$AuditOnly -Confirm:$false
+
     # A stage that logs nothing is indistinguishable from a stage that did nothing.
     $planned = (Get-TierActionLog).Count - $nestingBefore
     Write-TierLog -Message "Group nesting: $planned item(s) processed" -Level Info
+}
+
+function Set-TierBuiltInGroupNesting {
+    <#
+        .SYNOPSIS
+        Nests declared groups into built-in groups such as DnsAdmins, additively.
+
+        .DESCRIPTION
+        A role that needs the permissions of a built-in group holds them by being nested into it,
+        so the built-in group itself can stay empty of human members. That nesting has to happen
+        somewhere, and the privileged group stage is the wrong place: it runs in report mode by
+        default, where an absent declared member is reported rather than added. A role would then
+        sit there with no permissions at all until somebody switched that stage to Enforce - which
+        is the switch with the largest blast radius in the whole configuration and not something
+        to require for a DNS delegation to work.
+
+        The division is deliberate:
+
+          * this function only ever ADDS the members the configuration declares
+          * removing members that are not declared stays with the privileged group stage
+
+        The two therefore cannot fight, but only as long as everything nested here is also
+        declared in privilegedGroups.allowedMembers. Role expansion writes both from one
+        declaration; a hand-written builtInNesting entry could get it wrong, so the mismatch is
+        checked and the nesting skipped rather than left to flap - added by one stage on Monday,
+        removed by the other on Tuesday, with a report that looks fine on both days.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object]$Configuration,
+        [switch]$AuditOnly
+    )
+
+    if (-not ($Configuration.PSObject.Properties.Name -contains 'builtInNesting')) { return }
+    $entries = @($Configuration.builtInNesting | Where-Object { $_ })
+    if (-not $entries) { return }
+
+    Write-TierLog -Message 'Built-in group nesting' -Level Header
+    $ad = Get-TierAdParameter
+
+    foreach ($entry in $entries) {
+        if (-not $entry.group) {
+            Write-TierLog -Message 'A builtInNesting entry names no group - skipped' -Level Warning
+            continue
+        }
+
+        $key = if ($entry.group.PSObject.Properties.Name -contains 'sid' -and $entry.group.sid) { $entry.group.sid } else { $entry.group.name }
+
+        $group = $null
+        try { $group = Get-TierPrivilegedGroupReference -Entry $entry.group -Properties @('member') }
+        catch {
+            Write-TierLog -Message "Built-in group '$key' could not be resolved - $($_.Exception.Message)" -Level Warning
+        }
+
+        if (-not $group) {
+            # DnsAdmins does not exist until the DNS server role has been installed, which is a
+            # legitimate state rather than a fault.
+            Write-TierLog -Message "Built-in group '$key' does not exist in this domain - skipped" -Level Skip
+            Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target $key -Result 'Missing' `
+                -Detail 'The group does not exist in this domain'
+            continue
+        }
+
+        # The declaration in privilegedGroups is what stops the next enforce run from undoing this.
+        $declared = $null
+        if ($Configuration.privilegedGroups) {
+            $declared = @($Configuration.privilegedGroups.groups | Where-Object {
+                    ($_.PSObject.Properties.Name -contains 'sid' -and $_.sid -eq $key) -or
+                    ($_.PSObject.Properties.Name -contains 'name' -and $_.name -eq $key)
+                }) | Select-Object -First 1
+        }
+
+        foreach ($memberName in @($entry.members | Where-Object { $_ })) {
+            if ($declared -and (@($declared.allowedMembers) -notcontains $memberName)) {
+                Write-TierLog -Message "$memberName is nested into $($group.Name) but not declared in privilegedGroups - an enforce run would remove it again. Nesting skipped." -Level Error
+                Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Failed' `
+                    -Detail 'Not listed in privilegedGroups.allowedMembers - the two stages would fight over it' -Severity 'High'
+                continue
+            }
+
+            $member = Resolve-TierPrincipal -Reference $memberName -AllowMissing
+            if (-not $member -or -not $member.DistinguishedName) {
+                if ($WhatIfPreference) {
+                    Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Planned'
+                }
+                else {
+                    Write-TierLog -Message "Member '$memberName' for $($group.Name) not found" -Level Warning
+                    Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Missing'
+                }
+                continue
+            }
+
+            if ($group.member -contains $member.DistinguishedName) {
+                Write-TierLog -Message "$memberName already nested in $($group.Name)" -Level Skip
+                Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Compliant'
+                continue
+            }
+
+            if ($AuditOnly) {
+                Write-TierLog -Message "Nesting missing: $($group.Name) <- $memberName" -Level Warning
+                # The role exists but holds none of the permissions it was created for, which is
+                # a control that is configured and not in effect.
+                Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Missing' `
+                    -Detail 'The role holds none of this group''s permissions until it is nested' -Severity 'Medium'
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($group.Name, "Add member $memberName")) {
+                try {
+                    Add-ADGroupMember -Identity $group.DistinguishedName -Members $member.DistinguishedName @ad -ErrorAction Stop
+                    Write-TierLog -Message "Nested $memberName into $($group.Name)" -Level Success
+                    Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Created' -Detail $entry.comment
+                }
+                catch {
+                    Write-TierLog -Message "Failed to nest $memberName into $($group.Name) - $($_.Exception.Message)" -Level Error
+                    Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Failed' -Detail $_.Exception.Message
+                }
+            }
+            else {
+                Add-TierAction -Phase 'Nesting' -ObjectType 'BuiltInGroup' -Target "$($group.Name) <- $memberName" -Result 'Planned'
+            }
+        }
+    }
 }
 
 function New-TierAdminAccountSet {
@@ -2472,6 +3346,213 @@ function Set-TierDelegationSet {
     Write-TierLog -Message "ACL delegation: $planned item(s) processed" -Level Info
 }
 
+function Set-TierObjectOwnership {
+    <#
+        .SYNOPSIS
+        Reports, and optionally corrects, the owner of every object below the tier model.
+
+        .DESCRIPTION
+        The delegation model in this tool deliberately withholds WriteDacl and WriteOwner, so that
+        a tier administrator cannot rewrite the permissions that constrain them. Ownership goes
+        around that: an owner holds WRITE_DAC implicitly, whatever the DACL says.
+
+        Windows decides the owner of a new object from the creator's token. A member of Domain
+        Admins creates objects owned by Domain Admins; everybody else creates objects owned by
+        themselves. A delegated tier administrator therefore owns every object they create - and
+        an owned sub-OU can be re-permissioned, have objects moved into it, and be opened up to
+        principals from another tier. The granular delegation is binding only until somebody
+        creates something.
+
+        This stage is the reason deployment alone is not enough. It finds nothing on a freshly
+        deployed model, because everything was created by the deployment account, and starts
+        finding things the moment the model is actually used. That makes it a sync stage rather
+        than a deploy stage - it is included in both.
+
+        Report mode is the default. Enforce mode reassigns the owner, which needs WriteOwner on
+        the object; note that WRITE_OWNER on its own only permits setting the owner to the caller
+        or to a group the caller belongs to, so the declared owner should be a group the operator
+        is a member of - Domain Admins, in the shipped configuration.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object]$Configuration,
+        [switch]$AuditOnly
+    )
+
+    if (-not ($Configuration.PSObject.Properties.Name -contains 'ownership') -or -not $Configuration.ownership) { return }
+    $definition = $Configuration.ownership
+    if ($definition.PSObject.Properties.Name -contains 'enabled' -and -not $definition.enabled) {
+        Write-TierLog -Message 'Ownership checking is disabled in the configuration' -Level Info
+        return
+    }
+
+    Write-TierLog -Message 'Object ownership' -Level Header
+    Clear-TierPrincipalCache
+    $ad = Get-TierAdParameter
+    $ctx = Get-TierContext
+
+    $enforce = ($definition.mode -eq 'Enforce') -and -not $AuditOnly
+    Write-TierLog -Message "Mode: $(if ($enforce) { 'ENFORCE - owners will be reassigned' } else { 'report only' })" `
+        -Level $(if ($enforce) { 'Warning' } else { 'Info' })
+
+    # --- the owner that objects are supposed to have --------------------------------------------
+    $ownerReference = if ($definition.owner) { $definition.owner } else { '512' }
+    $ownerPrincipal = Resolve-TierPrincipalReference -Reference $ownerReference -AllowMissing
+    if (-not $ownerPrincipal) {
+        Write-TierLog -Message "Declared owner '$ownerReference' could not be resolved - stage skipped" -Level Error
+        Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $ownerReference -Result 'Failed' -Detail 'Declared owner does not resolve'
+        return
+    }
+
+    # Additional owners that are acceptable without being the declared one. A model that keeps
+    # Enterprise Admins as the owner of objects it created should not be told about it daily.
+    $acceptable = @{}
+    $acceptable[$ownerPrincipal.SID] = $ownerReference
+    foreach ($extra in @($definition.acceptableOwners | Where-Object { $_ })) {
+        $resolved = Resolve-TierPrincipalReference -Reference $extra -AllowMissing
+        if ($resolved) { $acceptable[$resolved.SID] = $extra }
+        else { Write-TierLog -Message "Acceptable owner '$extra' could not be resolved - ignored" -Level Warning }
+    }
+
+    # --- what to look at -------------------------------------------------------------------------
+    $scopes = @($definition.scopes | Where-Object { $_ })
+    if (-not $scopes) { $scopes = @('$ModelRoot') }
+
+    $classes = @($definition.objectClasses | Where-Object { $_ })
+    if (-not $classes) { $classes = @('user', 'group', 'computer', 'organizationalUnit', 'msDS-GroupManagedServiceAccount') }
+
+    # 'computer' derives from 'user' in the schema, so a bare (objectClass=user) also matches every
+    # computer account. Pairing it with the category keeps a configuration that asks only for users
+    # from silently auditing the whole server estate as well.
+    $clauses = foreach ($class in $classes) {
+        if ($class -eq 'user') { '(&(objectClass=user)(objectCategory=person))' } else { "(objectClass=$class)" }
+    }
+    $filter = '(|' + ($clauses -join '') + ')'
+
+    $maxObjects = 5000
+    if ($definition.maxObjects) { $maxObjects = [int]$definition.maxObjects }
+
+    # The top tier is the one where a foreign owner is not merely untidy: whoever owns a Tier 0
+    # object can rewrite its DACL, and a Tier 0 DACL is the boundary itself.
+    $topTierName = @($Configuration.tiers)[0].name
+
+    $totalCompliant = 0
+    $totalDrift = 0
+    $totalCorrected = 0
+    $totalFailed = 0
+    $listed = 0
+    $listLimit = 100
+
+    foreach ($scope in $scopes) {
+        $scopeDn = Resolve-TierOuDn -Reference $scope
+
+        $objects = @()
+        try {
+            # ResultSetSize is deliberately one over the cap, so exceeding it is detectable rather
+            # than silently truncating the audit and reporting a clean result.
+            $objects = @(Get-ADObject -SearchBase $scopeDn -SearchScope Subtree -LDAPFilter $filter `
+                    -Properties nTSecurityDescriptor -ResultSetSize ($maxObjects + 1) @ad -ErrorAction Stop)
+        }
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+            if ($AuditOnly -or $WhatIfPreference) {
+                Add-TierAction -Phase 'Ownership' -ObjectType 'OwnershipScope' -Target $scopeDn -Result 'Missing' -Detail 'Scope does not exist yet'
+                continue
+            }
+            throw
+        }
+        catch {
+            Write-TierLog -Message "Reading $scopeDn failed - $($_.Exception.Message)" -Level Error
+            Add-TierAction -Phase 'Ownership' -ObjectType 'OwnershipScope' -Target $scopeDn -Result 'Failed' -Detail $_.Exception.Message
+            continue
+        }
+
+        if ($objects.Count -gt $maxObjects) {
+            Write-TierLog -Message "$scopeDn holds more than $maxObjects objects - only the first $maxObjects were checked. Raise ownership.maxObjects or narrow the scope." -Level Warning
+            Add-TierAction -Phase 'Ownership' -ObjectType 'OwnershipScope' -Target $scopeDn -Result 'Drift' `
+                -Detail "More than $maxObjects objects in scope - the check is incomplete" -Severity 'Medium'
+            $objects = $objects[0..($maxObjects - 1)]
+        }
+
+        Write-TierLog -Message "$scopeDn : $($objects.Count) object(s) in scope" -Level Info
+
+        foreach ($object in $objects) {
+            $currentOwner = $null
+            try { $currentOwner = $object.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]) }
+            catch {
+                Write-TierLog -Message "Owner of $($object.DistinguishedName) is unreadable - $($_.Exception.Message)" -Level Warning
+                Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $object.DistinguishedName -Result 'Failed' -Detail $_.Exception.Message
+                continue
+            }
+
+            if ($currentOwner -and $acceptable.ContainsKey($currentOwner.Value)) {
+                # Counted, not logged. One action per compliant object would bury every real
+                # finding under a few thousand lines that all say nothing happened.
+                $totalCompliant++
+                continue
+            }
+
+            $totalDrift++
+            $ownerName = if ($currentOwner) { (Resolve-TierPrincipal -Reference $currentOwner.Value -AllowMissing).Name } else { $null }
+            if (-not $ownerName) { $ownerName = if ($currentOwner) { $currentOwner.Value } else { '<no owner>' } }
+
+            # A foreign owner in the top tier is an open path to the tier boundary, not untidiness.
+            $severity = if ($object.DistinguishedName -match [regex]::Escape("OU=$topTierName,")) { 'High' } else { 'Medium' }
+
+            if (-not $enforce) {
+                if ($listed -lt $listLimit) {
+                    Write-TierLog -Message "Owner drift: $($object.DistinguishedName) is owned by $ownerName" -Level Warning
+                    Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $object.DistinguishedName -Result 'Drift' `
+                        -Detail "Owned by $ownerName instead of $ownerReference - the owner can rewrite this object's permissions" -Severity $severity
+                    $listed++
+                }
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($object.DistinguishedName, "Set owner to $ownerReference")) {
+                try {
+                    Set-TierDirectoryOwner -Dn $object.DistinguishedName -OwnerSid $ownerPrincipal.SID | Out-Null
+                    Write-TierLog -Message "Owner corrected on $($object.DistinguishedName) (was $ownerName)" -Level Success
+                    Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $object.DistinguishedName -Result 'Updated' -Detail "Was owned by $ownerName"
+                    $totalCorrected++
+                }
+                catch {
+                    Write-TierLog -Message "Could not set the owner of $($object.DistinguishedName) - $($_.Exception.Message)" -Level Error
+                    Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $object.DistinguishedName -Result 'Failed' -Detail $_.Exception.Message
+                    $totalFailed++
+                }
+            }
+            else {
+                Add-TierAction -Phase 'Ownership' -ObjectType 'Owner' -Target $object.DistinguishedName -Result 'Planned' -Detail "Would be reassigned from $ownerName"
+            }
+        }
+    }
+
+    if ($listed -ge $listLimit -and $totalDrift -gt $listed) {
+        $remaining = $totalDrift - $listed
+        Write-TierLog -Message "$remaining further object(s) with a drifted owner were not listed individually" -Level Warning
+        Add-TierAction -Phase 'Ownership' -ObjectType 'OwnershipScope' -Target 'Owner drift' -Result 'Drift' `
+            -Detail "$remaining further object(s) beyond the first $listLimit" -Severity 'Medium'
+    }
+
+    Add-TierAction -Phase 'Ownership' -ObjectType 'OwnershipSummary' -Target "Owned by $ownerReference" -Result 'Compliant' `
+        -Detail "$totalCompliant object(s) with an acceptable owner"
+
+    # An object whose owner was just corrected is not a finding - reporting it as drift after
+    # fixing it makes a successful enforce run look like a failed audit.
+    if ($enforce) {
+        $verdict = if ($totalFailed -gt 0) { 'Error' } else { 'Success' }
+        Write-TierLog -Message "Ownership: $totalCompliant already correct, $totalCorrected corrected, $totalFailed failed" -Level $verdict
+    }
+    else {
+        $verdict = if ($totalDrift -eq 0) { 'Success' } else { 'Warning' }
+        Write-TierLog -Message "Ownership: $totalCompliant acceptable, $totalDrift drifted" -Level $verdict
+    }
+
+    if ($totalDrift -gt 0 -and -not $enforce) {
+        Write-TierLog -Message 'An owner holds WRITE_DAC implicitly. Until these are corrected, the granular delegation on those objects is advisory. Set ownership.mode to Enforce once you have reviewed the list.' -Level Warning
+    }
+}
+
 function Set-TierPrivilegedGroupMembership {
     <#
         .SYNOPSIS
@@ -2526,9 +3607,10 @@ function Set-TierPrivilegedGroupMembership {
     }
 
     foreach ($entry in @($definition.groups)) {
-        $group = Get-TierWellKnownGroup -Sid $entry.sid
+        $group = Get-TierPrivilegedGroupReference -Entry $entry
         if (-not $group) {
-            Write-TierLog -Message "Group with SID $($entry.sid) not present in this domain - skipped" -Level Skip
+            $reference = if ($entry.sid) { "SID $($entry.sid)" } else { "group '$($entry.name)'" }
+            Write-TierLog -Message "$reference not present in this domain - skipped" -Level Skip
             continue
         }
 
@@ -3138,6 +4220,44 @@ function New-TierGpoSet {
                     catch {
                         Write-TierLog -Message "Deny ACE on $($gpoDef.name) failed - $($_.Exception.Message)" -Level Error
                         Add-TierAction -Phase 'GPO' -ObjectType 'GpoFiltering' -Target "$($gpoDef.name) deny $($gpoDef.exceptionGroup)" -Result 'Failed' -Detail $_.Exception.Message
+                    }
+                }
+            }
+
+            # --- delegation and ownership ---------------------------------------------------
+            if ($gpoDef.PSObject.Properties.Name -contains 'delegation' -and $gpoDef.delegation) {
+                foreach ($outcome in @(Set-TierGpoDelegation -Gpo $creation.Gpo -Delegation $gpoDef.delegation -AuditOnly:$AuditOnly -Confirm:$false)) {
+                    $level = switch ($outcome.Result) {
+                        'Compliant' { 'Skip' }
+                        'Failed' { 'Error' }
+                        'Missing' { 'Warning' }
+                        default { 'Success' }
+                    }
+                    Write-TierLog -Message "GPO delegation $($outcome.Target): $($outcome.Result)" -Level $level
+                    Add-TierAction -Phase 'GPO' -ObjectType 'GpoDelegation' -Target $outcome.Target -Result $outcome.Result -Detail $outcome.Detail
+                }
+
+                if ($gpoDef.delegation.owner) {
+                    $ownerPrincipal = Resolve-TierPrincipalReference -Reference $gpoDef.delegation.owner -AllowMissing
+                    if (-not $ownerPrincipal) {
+                        Write-TierLog -Message "GPO owner '$($gpoDef.delegation.owner)' for $($gpoDef.name) not found" -Level Warning
+                        Add-TierAction -Phase 'GPO' -ObjectType 'GpoOwner' -Target $gpoDef.name -Result 'Missing'
+                    }
+                    else {
+                        $gpoDn = "CN={$($creation.Gpo.Id.ToString().ToUpper())},$((Get-TierContext).PoliciesDn)"
+                        try {
+                            $ownerResult = Set-TierGpoOwner -GpoDn $gpoDn -OwnerSid $ownerPrincipal.SID -AuditOnly:$AuditOnly -Confirm:$false
+                            $level = if ($ownerResult -eq 'Compliant') { 'Skip' } elseif ($ownerResult -eq 'Missing') { 'Warning' } else { 'Success' }
+                            Write-TierLog -Message "GPO owner $($gpoDef.name) -> $($gpoDef.delegation.owner): $ownerResult" -Level $level
+                            # An owner other than the declared one means the creator can still
+                            # rewrite the DACL, so a drifted owner is a real finding, not cosmetic.
+                            Add-TierAction -Phase 'GPO' -ObjectType 'GpoOwner' -Target "$($gpoDef.name) owner" -Result $ownerResult `
+                                -Detail 'An owner holds WRITE_DAC implicitly and can undo the delegation on this policy'
+                        }
+                        catch {
+                            Write-TierLog -Message "Setting the owner of $($gpoDef.name) failed - $($_.Exception.Message)" -Level Error
+                            Add-TierAction -Phase 'GPO' -ObjectType 'GpoOwner' -Target "$($gpoDef.name) owner" -Result 'Failed' -Detail $_.Exception.Message
+                        }
                     }
                 }
             }
@@ -3856,8 +4976,8 @@ function Invoke-TierModelDeployment {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory)][string]$ConfigurationPath,
-        [ValidateSet('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo')]
-        [string[]]$Stage = @('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo'),
+        [ValidateSet('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'Ownership', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo')]
+        [string[]]$Stage = @('RecycleBin', 'OU', 'Domain', 'Group', 'Nesting', 'Account', 'Delegation', 'Ownership', 'PrivilegedGroups', 'Auditing', 'GPO', 'Laps', 'KDS', 'Silo'),
         [string]$Server,
         [string]$LogDirectory = (Join-Path (Get-Location) 'Logs'),
         [string]$ReportDirectory = (Join-Path (Get-Location) 'Reports'),
@@ -3892,6 +5012,7 @@ function Invoke-TierModelDeployment {
     if ($Stage -contains 'Nesting')    { Set-TierGroupNesting   -Configuration $config -Confirm:$false }
     if ($Stage -contains 'Account')    { New-TierAdminAccountSet -Configuration $config -CredentialDirectory $CredentialDirectory -Confirm:$false }
     if ($Stage -contains 'Delegation') { Set-TierDelegationSet  -Configuration $config -Confirm:$false }
+    if ($Stage -contains 'Ownership')  { Set-TierObjectOwnership -Configuration $config -Confirm:$false }
     if ($Stage -contains 'PrivilegedGroups') { Set-TierPrivilegedGroupMembership -Configuration $config -Confirm:$false }
     if ($Stage -contains 'Auditing')   { Set-TierAuditPolicy    -Configuration $config -Confirm:$false }
     if ($Stage -contains 'GPO')        { New-TierGpoSet         -Configuration $config -Force:$Force -Confirm:$false }
@@ -3970,6 +5091,10 @@ function Invoke-TierModelSync {
 
     Set-TierGroupNesting -Configuration $config -Confirm:$false
     New-TierAuthenticationSilo -Configuration $config -Confirm:$false
+    # Ownership belongs here rather than only in deployment: a freshly deployed model has no
+    # drifted owners at all, because the deployment account created everything. Drift appears the
+    # first time a delegated administrator creates an object, which is a Tuesday, not a rollout.
+    Set-TierObjectOwnership -Configuration $config -Confirm:$false
     Set-TierPrivilegedGroupMembership -Configuration $config -AuditOnly -Confirm:$false
 
     $actions = Get-TierActionLog
@@ -4082,6 +5207,7 @@ function Invoke-TierModelAudit {
     Set-TierGroupNesting       -Configuration $config -AuditOnly -Confirm:$false
     New-TierAdminAccountSet    -Configuration $config -AuditOnly -Confirm:$false
     Set-TierDelegationSet      -Configuration $config -AuditOnly -Confirm:$false
+    Set-TierObjectOwnership    -Configuration $config -AuditOnly -Confirm:$false
     Set-TierPrivilegedGroupMembership -Configuration $config -AuditOnly -Confirm:$false
     Set-TierAuditPolicy        -Configuration $config -AuditOnly -Confirm:$false
     New-TierGpoSet             -Configuration $config -AuditOnly -Confirm:$false

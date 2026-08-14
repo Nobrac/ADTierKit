@@ -7,6 +7,10 @@ Credentials/
 *.bak-*
 config/*.bak-*
 
+# Configuration backups written by Update-TierConfiguration.ps1
+config/*.bak
+config/tiermodel.json.*.bak
+
 # Editor and OS noise
 .vscode/
 .idea/

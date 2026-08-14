@@ -1,0 +1,177 @@
+{
+  "_comment": "Paste the 'roles' array into config/tiermodel.json as a top level property. Expansion happens at load time: every entry becomes a global group, a disabled template account, a set of ACEs, a membership in the deny logon group of every other tier and a membership in the tier silo. Nothing here needs a new deployment stage.",
+
+  "roles": [
+    {
+      "name": "DNS",
+      "enabled": true,
+      "tiers": [0],
+      "roleGroup": "G-{TOKEN}-DNS-Admins",
+      "roleGroupOu": "Groups",
+      "templateAccount": "adm-{TOKENLC}-dns-template",
+      "description": "DNS administration for {TIER}. Holds its permissions through DnsAdmins, which stays empty of direct members.",
+      "nestIntoForeignDenyGroups": true,
+      "siloMember": true,
+      "privilegedGroupNesting": [
+        { "name": "DnsAdmins" }
+      ],
+      "delegations": [
+        {
+          "targetOu": "$MicrosoftDns",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "dnsZone",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete DNS zones and conditional forwarders on the DNS server object. This security descriptor is shared by every domain controller in the domain."
+        },
+        {
+          "targetOu": "$DomainDnsZones",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "dnsZone",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "The same right in the domain DNS application partition, where zones created since Windows Server 2003 actually live."
+        },
+        {
+          "targetOu": "$DomainDnsZones",
+          "rights": "ReadProperty, WriteProperty, Delete, DeleteTree",
+          "objectType": null,
+          "inheritedObjectType": null,
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Manage the zones and records below the partition. WriteDacl and WriteOwner are deliberately absent, as everywhere else in this model."
+        }
+      ]
+    },
+
+    {
+      "name": "DNS-Records",
+      "enabled": false,
+      "tiers": [1],
+      "roleGroup": "G-{TOKEN}-DNS-Operators",
+      "templateAccount": "adm-{TOKENLC}-dnsrec-template",
+      "description": "Record level DNS operations for {TIER} in one delegated application zone. Cannot create or delete zones and has no access to _msdcs.",
+      "nestIntoForeignDenyGroups": true,
+      "siloMember": true,
+      "delegations": [
+        {
+          "targetOu": "$DnsZone:apps.example.com",
+          "rights": "CreateChild, DeleteChild",
+          "objectType": "dnsNode",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create and delete records in this zone only. Change the zone name before enabling this role."
+        },
+        {
+          "targetOu": "$DnsZone:apps.example.com",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": null,
+          "inheritedObjectType": "dnsNode",
+          "inheritance": "Descendents",
+          "type": "Allow",
+          "comment": "Update existing records in this zone."
+        }
+      ]
+    },
+
+    {
+      "name": "GPO",
+      "enabled": true,
+      "tiers": [0],
+      "roleGroup": "G-{TOKEN}-GPO-Admins",
+      "templateAccount": "adm-{TOKENLC}-gpo-template",
+      "description": "Group Policy creation for the whole domain. Creating a policy is a Tier 0 operation because the creator becomes its owner.",
+      "nestIntoForeignDenyGroups": true,
+      "siloMember": true,
+      "privilegedGroupNesting": [
+        { "sid": "520" }
+      ],
+      "delegations": [
+        {
+          "targetOu": "$PoliciesContainer",
+          "rights": "CreateChild",
+          "objectType": "groupPolicyContainer",
+          "inheritedObjectType": null,
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Create policy objects in the directory. The matching SYSVOL folder rights come from Group Policy Creator Owners, which is why the role is nested into it rather than granted the folder ACL directly."
+        },
+        {
+          "targetOu": "$DomainRoot",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": "gPLink",
+          "inheritedObjectType": null,
+          "inheritance": "None",
+          "type": "Allow",
+          "comment": "Link policies at the domain head - a Tier 0 operation. Deliberately without gPOptions."
+        }
+      ]
+    },
+
+    {
+      "name": "GPO-Link",
+      "enabled": true,
+      "tiers": [1, 2],
+      "roleGroup": "G-{TOKEN}-GPO-Admins",
+      "templateAccount": "adm-{TOKENLC}-gpo-template",
+      "description": "Links and unlinks Group Policy objects within the {TIER} branch, and edits the policies delegated to {TIER}. Cannot create policies and cannot block inheritance.",
+      "nestIntoForeignDenyGroups": true,
+      "siloMember": true,
+      "delegations": [
+        {
+          "targetOu": "",
+          "rights": "ReadProperty, WriteProperty",
+          "objectType": "gPLink",
+          "inheritedObjectType": "organizationalUnit",
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Link and unlink policies on the OUs of this tier. gPOptions is deliberately excluded: the GPMC 'Link GPOs' permission writes both attributes, and write access to gPOptions lets the delegate block inheritance and cancel out the baseline handed down from the domain."
+        },
+        {
+          "targetOu": "",
+          "rights": "ReadProperty",
+          "objectType": "gPOptions",
+          "inheritedObjectType": "organizationalUnit",
+          "inheritance": "All",
+          "type": "Allow",
+          "comment": "Read only, so the GPMC can display the inheritance state it is not allowed to change."
+        }
+      ]
+    }
+  ],
+
+  "_gpoDelegationExample": "Editing rights live on the policy, not on an OU, so they are declared on the GPO itself. Add a 'delegation' block to any entry in tiers[].gpos[]:",
+  "_gpoDelegationSample": {
+    "name": "T1-Logon-Restrictions",
+    "delegation": {
+      "editors": ["G-T1-GPO-Admins"],
+      "readers": [],
+      "owner": "512"
+    }
+  },
+
+  "_auditingAddition": "Add these rules to auditing.rules so that a rename or a WMI filter change on any policy is recorded. Both are reachable through the GpoEdit permission and neither is otherwise visible:",
+  "_auditingSample": [
+    {
+      "principal": "S-1-1-0",
+      "targetOu": "$PoliciesContainer",
+      "rights": "WriteProperty, WriteDacl, WriteOwner",
+      "flags": "Success",
+      "objectType": null,
+      "inheritance": "All",
+      "comment": "Record every change to a policy object, including displayName and gPCWQLFilter"
+    },
+    {
+      "principal": "S-1-1-0",
+      "targetOu": "$AdminSDHolder",
+      "rights": "WriteProperty, WriteDacl, WriteOwner",
+      "flags": "Success",
+      "objectType": null,
+      "inheritance": "All",
+      "comment": "The AdminSDHolder ACL is stamped onto every protected group hourly - a change here is a change to every Tier 0 group at once"
+    }
+  ]
+}

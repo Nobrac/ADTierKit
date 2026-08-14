@@ -8,7 +8,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2012R2%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
-[![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)](#what-has-been-tested)
+[![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)](#limitations--notes)
 [![License](https://img.shields.io/badge/license-MIT-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -17,7 +17,6 @@
 [**What it deploys**](#what-it-deploys) &nbsp;·&nbsp;
 [**Guardrails**](#guardrails) &nbsp;·&nbsp;
 [**Quick start**](#quick-start) &nbsp;·&nbsp;
-[**Tested**](#what-has-been-tested) &nbsp;·&nbsp;
 [**Design decisions**](#design-decisions-worth-knowing) &nbsp;·&nbsp;
 [**Troubleshooting**](#troubleshooting)
 
@@ -71,10 +70,10 @@ folder structure to preserve, no build step. Copy two files onto a domain contro
 > [!WARNING]
 > **Lab-tested, not production-tested.** Every mode has been run end to end against a Windows
 > Server 2025 lab domain, idempotency is verified at `Created: 0`, and the tier separation was
-> confirmed with real accounts in both directions — see [what has been
-> tested](#what-has-been-tested). It has never run against a production directory, has no Pester
-> suite and has not been reviewed by a second engineer. Take a system state backup of a domain
-> controller before the first enforced deployment.
+> confirmed with real accounts in both directions. It has never run against a production
+> directory and has not been reviewed by a second engineer — see [Limitations &
+> notes](#limitations--notes). Take a system state backup of a domain controller before the first
+> enforced deployment.
 
 > [!NOTE]
 > **Built with AI assistance.** Most of the code and documentation in this repository was written
@@ -88,11 +87,11 @@ folder structure to preserve, no build step. Copy two files onto a domain contro
 
 | Getting there | Understanding it | When you need it |
 |---|---|---|
-| [Modes](#modes) | [Design decisions](#design-decisions-worth-knowing) | [Troubleshooting](#troubleshooting) |
-| [What it deploys](#what-it-deploys) | [Configuration reference](#configuration-reference) | [When it goes wrong](#when-it-goes-wrong) |
-| [Guardrails](#guardrails) | [Reports and logging](#reports-and-logging) | [Checking the code](#checking-the-code) |
-| [Prerequisites](#prerequisites) | [What has been tested](#what-has-been-tested) | [Limitations & notes](#limitations--notes) |
-| [Quick start](#quick-start) | | [Repository layout](#repository-layout) |
+| [Modes](#modes) | [Roles](#roles) | [Troubleshooting](#troubleshooting) |
+| [What it deploys](#what-it-deploys) | [Ownership](#ownership) | [When it goes wrong](#when-it-goes-wrong) |
+| [Guardrails](#guardrails) | [Design decisions](#design-decisions-worth-knowing) | [Checking the code](#checking-the-code) |
+| [Prerequisites](#prerequisites) | [Configuration reference](#configuration-reference) | [Limitations & notes](#limitations--notes) |
+| [Quick start](#quick-start) | [Reports and logging](#reports-and-logging) | [Repository layout](#repository-layout) |
 | [Rollout order](#recommended-rollout-order) | | [License](#license) |
 
 ---
@@ -163,6 +162,185 @@ OU=Tiering
 </table>
 
 The isolation logic is deliberately simple and reviewable: each tier has exactly one deny-logon group, and the GPO denies that single SID the logon types that matter. Changing who is locked out of a tier is a group membership change, not a GPO edit.
+
+---
+
+## Roles
+
+DNS zones get created, Group Policy objects get written — jobs somebody has to be allowed to do
+without being allowed to do everything else.
+
+A role is not one object, which is what makes adding one by hand risky. It is a global group, a
+disabled template account, a set of ACEs, a membership in the deny logon group of *every other
+tier*, and a membership in the tier's authentication silo. Forgetting the deny nesting is the
+expensive one: the new group can then log on everywhere, and nothing reports it, because from the
+directory's point of view nothing is wrong. So a role is declared once and expanded into all of
+it at load time:
+
+```json
+"roles": [
+  {
+    "name": "DNS",
+    "tiers": [0],
+    "roleGroup": "G-{TOKEN}-DNS-Admins",
+    "templateAccount": "adm-{TOKENLC}-dns-template",
+    "privilegedGroupNesting": [ { "name": "DnsAdmins" } ],
+    "delegations": [ … ]
+  }
+]
+```
+
+Expansion happens inside `Import-TierConfiguration`, before validation and before any stage sees
+the configuration. Deploy, audit and sync therefore need no knowledge of roles at all — the groups
+and ACEs a role produces are indistinguishable from ones written out by hand, and are audited,
+synced and reported the same way.
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `tiers` | — | Which tier IDs the role is created in. One role, one group per listed tier. |
+| `roleGroup` | — | Naming pattern. `{ID}` `{TIER}` `{TOKEN}` `{TOKENLC}` `{ROLE}` `{ROLELC}`. |
+| `templateAccount` | none | Creates a disabled template account in the role group, like the tier templates. |
+| `nestIntoForeignDenyGroups` | `true` | Nests the role group into the deny logon group of every other tier. |
+| `siloMember` | `true` | Adds the role group to the tier's authentication policy silo. |
+| `privilegedGroupNesting` | none | Built-in groups the role is nested into, and which are then watched for direct members. |
+| `delegations` | none | ACEs, in the same format as `tiers[].delegations`. `principal` defaults to the role group. |
+| `enabled` | `true` | `false` expands nothing. |
+
+`nestIntoForeignDenyGroups` defaults to on because the failure mode of forgetting it is silent and
+the failure mode of over-denying is a logon error somebody notices within the hour.
+
+### Nesting into built-in groups
+
+`privilegedGroupNesting` produces **two** things from one declaration, and they are not the same:
+
+- an entry in `privilegedGroups`, which is what *watches* the built-in group for members that are
+  not supposed to be there
+- an entry in `builtInNesting`, which is what actually *performs* the nesting, from the `Nesting`
+  stage
+
+The split exists because the privileged group stage runs in report mode by default, where an
+absent declared member is reported rather than added — a DNS role would hold no permissions at
+all until somebody switched `privilegedGroups.mode` to `Enforce`.
+
+The division of labour is strict: `Nesting` only ever *adds* what the configuration declares,
+`PrivilegedGroups` only ever *removes* what it does not. They cannot fight, as long as everything
+nested is also declared. Role expansion writes both from one line; a hand-written `builtInNesting`
+entry that gets it wrong is refused rather than left to flap between the two stages.
+
+Two refusals worth knowing:
+
+- **A role below the top tier cannot be nested into a privileged built-in group.** `DnsAdmins`
+  members can load a DLL into a service running as SYSTEM on a domain controller. The role group
+  is still created — only the nesting is refused, as a High finding.
+- **A built-in group that does not exist is a state, not a fault.** `DnsAdmins` appears with the
+  DNS server role; the entry is skipped and reported at Low severity.
+
+In audit mode, a role that exists but is not nested is a **Medium** finding: configured, not in
+effect.
+
+Roles reach containers outside the tier model — the DNS server object, the policies container,
+`AdminSDHolder` — through seven additional `targetOu` values listed under
+[OU references](#ou-references).
+
+### The two roles that ship
+
+Both are in `config/roles.example.json`, and both are Tier 0 where they create objects — creating
+a DNS zone means being able to create records under `_msdcs`, and creating a Group Policy object
+makes you its owner.
+
+**DNS.** The goal is an empty `DnsAdmins`. Its members can load a DLL into a service running as
+SYSTEM on a domain controller, and it is neither covered by AdminSDHolder nor marked with
+`adminCount`, so nothing in a standard audit flags it as privileged. The role holds its
+permissions by being nested into it, and the group is watched so a direct member becomes a
+finding.
+
+`DnsAdmins` is also the one group here not addressed by SID: created by the DNS server role rather
+than the operating system, it has an ordinary RID that differs between domains — but it is not
+localised either, which is what makes the name lookup safe there and nowhere else.
+
+**Group Policy.** The interesting part is what the role deliberately cannot do. The GMPC
+permission called *Link GPOs* grants write access to both `gpLink` and `gpOptions`, and write
+access to `gpOptions` is the ability to block inheritance and cancel every policy handed down from
+the domain — including the baseline. The shipped delegation grants `gpLink` for writing and
+`gpOptions` for reading only. The GPMC displays the inheritance state correctly and refuses to
+change it.
+
+*Edit settings* is less satisfying: it maps to write access on all properties, so a delegate can
+rename a policy and change its WMI filter, and changing the filter changes which machines it
+applies to. The narrower grant that would prevent it is refused by the GPMC, which will not open a
+policy it cannot fully write. Auditing is the available mitigation, so `$PoliciesContainer` carries
+a SACL and every rename and filter change is recorded.
+
+### Who owns a policy
+
+Creation stays in Tier 0 for a reason the delegation model cannot work around: **an owner holds
+`WRITE_DAC` implicitly, whatever the DACL says.** A policy created by a delegated administrator is
+permanently re-permissionable by them, and any granular delegation placed on it afterwards is
+advisory.
+
+Any GPO in the configuration can now declare its owner and its editors:
+
+```json
+{
+  "name": "T1-Logon-Restrictions",
+  "delegation": {
+    "editors": ["G-T1-GPO-Admins"],
+    "owner": "512"
+  }
+}
+```
+
+The owner is compared on every run and reported when it has drifted, because a drifted owner means
+the granular delegation on that object is no longer binding.
+
+The same problem exists for every object a tier administrator creates in their own branch — a
+sub-OU they own is one they can re-permission and move objects into. That is what the `Ownership`
+stage is for.
+
+---
+
+## Ownership
+
+The delegation model withholds `WriteDacl` and `WriteOwner` so that a tier administrator cannot
+rewrite the permissions that constrain them. Ownership goes around it: **an owner holds
+`WRITE_DAC` implicitly, whatever the DACL says.**
+
+Windows takes the owner of a new object from the creator's token. A member of `Domain Admins`
+creates objects owned by `Domain Admins`; everybody else creates objects owned by themselves. So a
+delegated administrator owns everything they create — and an owned sub-OU can be re-permissioned,
+have objects moved into it, and be opened to principals from another tier. The granular delegation
+is binding right up until somebody creates something.
+
+```json
+"ownership": {
+  "enabled": true,
+  "mode": "Report",
+  "owner": "512",
+  "acceptableOwners": [],
+  "scopes": ["$ModelRoot"],
+  "objectClasses": ["user", "group", "computer", "organizationalUnit", "msDS-GroupManagedServiceAccount"],
+  "maxObjects": 5000
+}
+```
+
+The stage finds **nothing at all on a freshly deployed model** — the deployment account created
+everything, so everything is owned correctly. It starts finding things the first time the model is
+actually used, which is why it runs in `Sync` as well as in `Deploy` and `Audit`.
+
+| Behaviour | Why |
+|---|---|
+| Report is the default | The first list is worth reading. Reassigning ownership silently on a daily scheduled task is not where this should start. |
+| Compliant objects are counted, not listed | One action per object would bury every real finding under several thousand lines saying nothing happened. Only drift is listed, and only the first 100, then a count. |
+| Drift in the top tier is High, elsewhere Medium | A Tier 0 DACL *is* the boundary. Elsewhere an owner can rewrite permissions on objects inside their own tier, which is untidy rather than an escalation path. |
+| `maxObjects` stops at 5000 by default | The check reads the security descriptor of every object in scope. Exceeding the cap is reported as a finding rather than silently truncating and returning a clean result. |
+| The declared owner should be a group you are in | `WRITE_OWNER` alone only permits setting the owner to the caller or to a group the caller belongs to. `Domain Admins` satisfies that for the account running the tool. |
+
+`acceptableOwners` exists for the cases that are fine but not the declared owner — objects created
+by `Enterprise Admins` during a forest operation, for instance. Listing them stops the same
+finding appearing every day.
+
+Switch `mode` to `Enforce` once the list has been reviewed. Nothing about reassigning an owner is
+destructive, but it is the kind of change that is easier to explain before it happens than after.
 
 ---
 
@@ -317,89 +495,6 @@ Keep at least one break-glass account **outside** the silo and outside `Protecte
 
 ---
 
-## What has been tested
-
-<div align="center">
-
-**205** objects deployed &nbsp;·&nbsp; **0** failures &nbsp;·&nbsp; **0** created on the second run &nbsp;·&nbsp; **6/6** modes exercised
-
-</div>
-
-Every mode has been run end to end against a Windows Server 2025 lab domain, and the tier
-separation was verified by using it — not by reading the log.
-
-### The deployment cycle
-
-| Check | Result |
-|---|---|
-| Full deployment, 13 stages | 205 objects created, 0 failures |
-| **Idempotency** — same command again | `Created: 0 · Updated: 0 · Compliant: 205 · Failed: 0` |
-| Audit against a live model | 205 objects recognised as compliant, no false drift |
-| Plan mode (`-Mode Deploy` without `-Apply`) | 104 planned, nothing written, log and report still produced |
-| Staged rollout (`-Stage`) | Structure and policy deployable separately |
-
-Idempotency is the one worth dwelling on. Every stage has to recognise its own work on the second
-run — including 39 delegation ACEs compared on rights, object type *and* inherited object type,
-SACL entries read through the `AD:` provider, GPO links, security template contents, and LAPS
-permissions on both the OU ACL and the extended rights. Getting this to `Created: 0` took several
-rounds; a check too loose duplicates ACEs on every run, one too strict reports everything as
-missing forever.
-
-### The separation actually works
-
-This is the part that matters, and it was verified from both directions with real accounts:
-
-| Test | Expected | Result |
-|---|---|---|
-| Tier 1 account logs on to a Tier 1 server | allowed | ✅ |
-| Tier 1 account logs on to the domain controller | denied | ✅ |
-| Tier 1 admin reads the LAPS password of a Tier 1 server | allowed | ✅ |
-| **Domain Admin** reads the same LAPS password | denied | ✅ |
-
-The last row is the one to appreciate. A Domain Admin has full read access to every attribute in
-the directory and still cannot recover that password, because the per-tier
-`ADPasswordEncryptionPrincipal` means only `G-T1-Admins` holds the decryption key. That is the
-whole argument for setting it per tier rather than once.
-
-### Membership maintenance
-
-A server moved into a tier OU and an account added to a tier group *after* deployment were both
-picked up by `-Mode Sync` and assigned to the authentication silo — the gap that a one-off
-deployment leaves open. The same sync was then run unattended through the scheduled task under
-`SYSTEM`, with a deliberately broken group nesting restored automatically:
-
-```
-[SUCCESS] Nested G-T0-Admins into DL-T2-DenyLogon
-```
-
-### The guardrails were tested by triggering them
-
-The lockout guard was verified the hard way: an earlier build without it locked the operator out
-of the domain controller entirely — recovered through DSRM and `secedit`. The guard was written in
-response, and on the rebuild it correctly blocked the GPO stage when a Domain Admin account sat in
-a deny group that reached the domain controller, while staying silent for the cross-tier denial
-that is the model working as intended.
-
-`Repair-TierLockout.ps1` was written and used during that recovery, not afterwards from theory.
-
-### Static analysis
-
-`Invoke-ScriptAnalyzer` reports no errors. The findings it did produce were acted on: four
-swallowed exceptions — two of them inside the lockout guard itself, where a failure would have
-silently disabled the protection — and a plaintext password parameter that is now a
-`SecureString`. See [Checking the code](#checking-the-code) for the rules that remain excluded and
-why.
-
-### What has *not* been tested
-
-Honestly, because the list matters as much as the one above: no production directory, no
-multi-domain forest, no Pester suite, no second engineer's review, and no code signing.
-`privilegedGroups.mode: Enforce`, `restrictedGroupsMode: Replace`, `logonRightsMode: AllowList` and
-silo `Enforce` have all been deployed but never enforced against a populated directory — those are
-the four switches with the largest blast radius, and they are the ones to introduce slowly.
-
----
-
 ## Design decisions worth knowing
 
 These are the places where the tool takes a position. Each one is configurable.
@@ -434,6 +529,21 @@ That omission is the point: with `GenericAll` a tier administrator can rewrite t
 
 `Domain Admins`, `Administrators`, `Account Operators`, `Protected Users` — all built-in group names are localised. A German directory calls them `Domänen-Admins` and `Administratoren`. Looking them up by name silently finds nothing, and the audit then cheerfully reports "no problems". Every privileged group in this tool is resolved through its well-known SID, so a localised directory works unchanged.
 
+### Every write is read back when success is not self-evident
+
+Most directory writes fail loudly. A few do not: `Set-ADObject` on `nTSecurityDescriptor` accepts
+an owner change and applies only the DACL, returning nothing to indicate it. Code that trusts the
+call reports a correction that never happened, on every run, forever.
+
+So the owner write reads the object back and compares before reporting anything. It costs one
+round trip per corrected object — nothing, since only drifted objects are written at all — and it
+converts an invisible false negative into a `Failed` line that names the object. The same
+reasoning is why enforce runs should be executed twice: the second run is the check, and it is
+worth doing by hand even where the code checks itself.
+
+DACL and SACL writes keep using `Set-ADObject`, because their success *is* self-evident: the next
+run compares every ACE and reports it compliant or missing.
+
 ### Membership does not stay correct by itself
 
 Deployment is a one-off event; membership is not. A server moved into a tier OU next month does not join the authentication silo on its own, and nothing in the directory notices.
@@ -456,7 +566,7 @@ The configuration is one JSON document, normally `config/tiermodel.json`. The wi
 | `{ID}` | `0` | all patterns |
 | `{TIER}` | `Tier-0` | all except the tier name itself |
 | `{TOKEN}` / `{TOKENLC}` | `T0` / `t0` | all except the tier token itself |
-| `{ROLE}` | `Admins` | role group pattern |
+| `{ROLE}` / `{ROLELC}` | `Admins`, `DNS` / `dns` | role group pattern, `roles` block |
 | `{RESOURCE}` | `DenyLogon` | access group pattern |
 | `{PURPOSE}` | `template`, `Logon-Restrictions` | account and GPO patterns |
 
@@ -471,6 +581,13 @@ Used anywhere a `targetOu` appears:
 | `"Tier-1/Servers"` | explicit path below the model root |
 | `"$DomainRoot"` | the domain naming context |
 | `"$DomainControllers"` | `OU=Domain Controllers,<domain>` |
+| `"$SystemContainer"` | `CN=System,<domain>` |
+| `"$MicrosoftDns"` | `CN=MicrosoftDNS,CN=System,<domain>` — the DNS server object |
+| `"$DomainDnsZones"` | the domain DNS application partition |
+| `"$ForestDnsZones"` | the forest DNS application partition |
+| `"$PoliciesContainer"` | `CN=Policies,CN=System,<domain>` |
+| `"$AdminSDHolder"` | `CN=AdminSDHolder,CN=System,<domain>` |
+| `"$DnsZone:contoso.com"` | that zone inside the domain DNS partition |
 | `"OU=…,DC=…"` | used verbatim |
 
 ### Selected options
@@ -483,6 +600,10 @@ Used anywhere a `targetOu` appears:
 | `gpos[].linkEnabled` | Per GPO: `false` keeps it linked but inactive, and a later deployment respects that instead of switching it back on. |
 | `restrictedGroupsMode` | `MemberOf` (additive) or `Replace` (strict). |
 | `authenticationPolicyEnforcement` | `Audit` or `Enforce`. |
+| `ownership.mode` | `Report` (default) or `Enforce`. See [Ownership](#ownership). |
+| `roles` | Role definitions. Expanded at load time into groups, accounts, ACEs, deny nesting and silo membership. See [Roles](#roles). |
+| `builtInNesting` | Generated by role expansion. Nests a group into a built-in group such as `DnsAdmins`, additively. |
+| `gpos[].delegation` | Per GPO: `editors`, `readers` and `owner`. |
 | `enableAdRecycleBin`, `createKdsRootKey`, `deployWindowsLaps` | Feature switches for the corresponding stages. |
 
 Two choices are **wizard-time, not runtime**: the logon rights mode (`Deny` / `AllowList`) and the
@@ -537,15 +658,14 @@ Check event IDs 4820 and 4821 on the domain controllers — they name the accoun
 
 ## When it goes wrong
 
-The tier model works by removing logon rights. That is the point, and it is also the failure mode:
-put the account you are working with into a tier role group, and the deny groups take its logon
-rights away on the systems of every other tier.
+The tier model works by removing logon rights, which is also its failure mode: put the account you
+are working with into a tier role group, and the deny groups take its logon rights away on every
+other tier's systems.
 
-**Why disabling the GPO does not help.** User rights are *tattooed*. When the security client-side
-extension applies the policy, the entry is written into the local security database of the machine.
-Unlinking or disabling the GPO afterwards only stops it being written *again* — it never removes
-what is already there, and it survives reboots. The right has to be put back locally with
-`secedit`, which means you need a way onto the machine first.
+**Disabling the GPO does not help.** User rights are *tattooed* — the security extension writes
+them into the machine's local security database, and unlinking the GPO only stops them being
+written *again*. They have to be put back locally with `secedit`, which means getting onto the
+machine first.
 
 ### Routes back in, in order
 
@@ -566,21 +686,17 @@ what is already there, and it survives reboots. The right has to be put back loc
 .\Repair-TierLockout.ps1 -EnableGpoLinks  # and re-enable the tier GPOs, if the check comes back clean
 ```
 
-Four steps, each reported before and after:
-
-1. Removes the built-in Administrator from every tier role group — the group names come from your
-   configuration, and nothing outside those groups is touched.
-2. Restores the default holders of the interactive logon rights on the domain controller and
-   clears the deny entries, then exports the result so you can see it rather than assume it.
-   `-SkipUserRightsRestore` keeps a hardened Administrators-only setting instead.
-3. Re-checks every deny group recursively against the account running the script, the built-in
-   Administrator, and the members of `Domain Admins`.
-4. Re-enables the GPO links — only with `-EnableGpoLinks`, and only if step 3 was clean.
+Four steps, each reported before and after: remove the built-in Administrator from every tier role
+group (names taken from your configuration, nothing outside them touched); restore the default
+holders of the interactive logon rights and clear the deny entries, exporting the result rather
+than assuming it — `-SkipUserRightsRestore` keeps an Administrators-only setting instead; re-check
+every deny group recursively against the running account, the built-in Administrator and `Domain
+Admins`; and re-enable the GPO links, only with `-EnableGpoLinks` and only if the check was clean.
 
 ### The manual way back
 
-If the script cannot run — no PowerShell remoting, DSRM only, or you would rather see every
-command — this is what it does. On the domain controller, elevated:
+If the script cannot run — DSRM only, no remoting, or you would rather see every command. On the
+domain controller, elevated:
 
 ```powershell
 @'
@@ -616,8 +732,7 @@ Get-ChildItem C:\Windows\SYSVOL\domain\Policies -Recurse -Filter GptTmpl.inf |
   ForEach-Object { Rename-Item $_.FullName "$($_.Name).bak"; $_.FullName }
 ```
 
-Then find out what actually happened. `scesrv.log` records every setting the security extension
-touched, with timestamps:
+Then find out what happened. `scesrv.log` records every setting the security extension touched:
 
 ```powershell
 Get-Content C:\Windows\security\logs\scesrv.log -Tail 120
@@ -629,26 +744,22 @@ a tier role group.
 
 ### What stops it happening again
 
-**The lockout guard** stops the deployment before it writes a restriction that would remove your
-own access on a machine you would need to undo it. It is described in full under
-[Guardrails](#guardrails), along with the other eight mechanisms that exist for the same reason.
+**The lockout guard** stops a deployment before it writes a restriction that would remove your own
+access on the machine you would need to undo it — see [Guardrails](#guardrails).
 
-**The domain controller baseline names its own allow side.** A template that writes only deny
-entries relies on the allow side being held somewhere else, and on a domain controller that can be
-an implicit default rather than a policy. The baseline therefore writes
-`SeInteractiveLogonRight` and `SeRemoteInteractiveLogonRight` explicitly with the administrators
-group, so applying it can never leave the controller without an administrative logon path.
+**The domain controller baseline names its own allow side.** A template writing only deny entries
+relies on the allow side living somewhere else, which on a domain controller is an implicit
+default rather than a policy. The baseline writes `SeInteractiveLogonRight` and
+`SeRemoteInteractiveLogonRight` explicitly, so applying it cannot leave the controller without an
+administrative logon path.
 
-**Disabled links stay disabled.** Each GPO carries a `linkEnabled` flag. Setting it to `false`
-keeps the GPO linked but inactive, and a later deployment respects that rather than switching it
-back on — which matters exactly when you disabled a link to get out of trouble.
+**Disabled links stay disabled.** `linkEnabled: false` keeps a GPO linked but inactive, and a
+later deployment respects that instead of switching it back on — which matters exactly when you
+disabled a link to get out of trouble.
 
-### Working practice
-
-Keep a second session open. Before enabling a logon restriction, open a second administrative
-session to the domain controller and leave it untouched. Then apply, run `gpupdate /force`, and
-verify a *fresh* logon in a third session. If it fails, the second session is still there and the
-recovery is a two-minute job instead of an evening.
+**Keep a second session open.** Before enabling a logon restriction, leave a second administrative
+session to the domain controller untouched. Apply, `gpupdate /force`, then verify a *fresh* logon
+in a third session. If it fails, recovery is a two-minute job instead of an evening.
 
 ---
 
@@ -684,8 +795,17 @@ swallowed exceptions, two of them inside the lockout guard itself, and
 - **Single domain per run.** For a forest, run once per domain and keep the top tier forest-wide. `Enterprise Admins` and `Schema Admins` live in the root domain; the prerequisite check says so when the target is a child domain.
 - **Domain controllers cannot be moved** out of `OU=Domain Controllers`; the top-tier restrictions are applied there through a separate linked GPO.
 - **Not included:** managed service account (MSA/gMSA/dMSA) ACL delegation, ADMX central store deployment, WMI filters, functional level upgrades, and prepackaged hardening baselines such as AppLocker, BitLocker or Defender. This tool secures the tier boundary; it is not a complete hardening suite.
-- **No automated tests.** The script passes PSScriptAnalyzer and has been run end to end against a
-  lab domain, but there is no Pester suite and no second reviewer.
+- **What has not been run.** No production directory, no multi-domain forest, no second
+  engineer's review, no code signing. `privilegedGroups.mode: Enforce`, `restrictedGroupsMode:
+  Replace`, `logonRightsMode: AllowList` and silo `Enforce` have been deployed but never enforced
+  against a populated directory — those four have the largest blast radius and are the ones to
+  introduce slowly. The `DnsAdmins` path through MMC or RPC is untested: it needs a second
+  machine, since a Tier 0 role account deliberately cannot log on to a domain controller.
+- **The test suites in `tests/` run offline against mocks.** They cover configuration expansion
+  and stage logic — useful for catching a refactor, useless for catching anything that depends on
+  how a real domain controller behaves, which is where the interesting failures live. A write that
+  the directory accepts and silently does not apply looks identical to a successful one from
+  inside a mock.
 
 ---
 
@@ -697,6 +817,9 @@ LICENSE                       MIT
 ADTierKit.ps1                 the entire tool
 Repair-TierLockout.ps1        recovery from a logon lockout
 config/tiermodel.json         your configuration — the source of truth
+config/roles.example.json     ready-made DNS and Group Policy roles to copy in
+Update-TierConfiguration.ps1  brings a pre-1.0 configuration up to the current schema
+tests/                        offline test suites — no domain required
 docs/                         screenshots used by this README
 Logs/                         per-run transcript, created on first run
 Reports/                      JSON + HTML reports
