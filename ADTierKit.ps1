@@ -40,7 +40,7 @@
     Continues even if the prerequisite check reports findings, and skips the safety questions.
 
     .NOTES
-    Version:  1.0.0
+    Version:  1.1.0
     License:  MIT
     Requires: Windows PowerShell 5.1, ActiveDirectory and GroupPolicy modules, Domain Admin.
 
@@ -144,7 +144,7 @@ Import-Module GroupPolicy -ErrorAction Stop
 #  Logging, configuration loading, runtime context and name resolution.
 ####################################################################################################
 
-$script:TierKitVersion = '1.0.0'
+$script:TierKitVersion = '1.1.0'
 $script:TierLogFile = $null
 $script:TierActions = [System.Collections.Generic.List[object]]::new()
 $script:TierContext = $null
@@ -3215,16 +3215,21 @@ function New-TierRandomPassword {
 
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try {
-        $pick = {
-            param($Pool)
-            # Rejection sampling keeps the distribution uniform - a plain modulo would bias
-            # the first characters of the pool.
-            $limit = [math]::Floor(256 / $Pool.Length) * $Pool.Length
+        # Rejection sampling keeps the distribution uniform - a plain modulo would bias
+        # the low indices. Used for character picks and for the shuffle below.
+        $nextIndex = {
+            param([int]$Count)
+            $limit = [math]::Floor(256 / $Count) * $Count
             do {
                 $byte = [byte[]]::new(1)
                 $rng.GetBytes($byte)
             } while ($byte[0] -ge $limit)
-            return $Pool[$byte[0] % $Pool.Length]
+            return $byte[0] % $Count
+        }
+
+        $pick = {
+            param($Pool)
+            return $Pool[(& $nextIndex $Pool.Length)]
         }
 
         # One character from every class first, the remainder from the full alphabet.
@@ -3232,11 +3237,11 @@ function New-TierRandomPassword {
         foreach ($set in $sets) { $chars.Add((& $pick $set)) }
         while ($chars.Count -lt $Length) { $chars.Add((& $pick $alphabet)) }
 
-        # Fisher-Yates shuffle so the class characters are not always in front.
+        # Fisher-Yates shuffle so the class characters are not always in front. The index comes
+        # from the same rejection-sampled source as the picks - a plain modulo here would bias
+        # the positions even though the characters themselves are uniform.
         for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-            $byte = [byte[]]::new(1)
-            $rng.GetBytes($byte)
-            $j = $byte[0] % ($i + 1)
+            $j = & $nextIndex ($i + 1)
             $tmp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $tmp
         }
 
@@ -4506,8 +4511,49 @@ function Set-TierWindowsLaps {
 
             # Find-LapsADExtendedRights reports holders as DOMAIN\Name, the configuration names
             # them bare - compare against both spellings or every run grants them again.
-            $qualifiedName = "$($ctx.DomainNetBios)\$($principal.Name)"
-            if (($granted -contains $principal.Name) -or ($granted -contains $qualifiedName)) {
+            #
+            # That list only covers the READ side: the cmdlet reports extended-rights holders,
+            # i.e. principals allowed to read the password attributes. The reset permission is
+            # WriteProperty on msLAPS-PasswordExpirationTime and never appears there, so it has
+            # to be checked against the OU ACL directly - the same technique as the computer
+            # self permission above, and for the same reason: without it the grant would be
+            # re-applied and reported as 'Created' on every run.
+            $present = $false
+            if ($permission.Kind -eq 'Read') {
+                $qualifiedName = "$($ctx.DomainNetBios)\$($principal.Name)"
+                $present = ($granted -contains $principal.Name) -or ($granted -contains $qualifiedName)
+            }
+            else {
+                try {
+                    if (-not $script:LapsExpirationTimeGuid) {
+                        $rootDseLocal = Get-ADRootDSE @ad
+                        $attribute = Get-ADObject -SearchBase $rootDseLocal.schemaNamingContext `
+                            -LDAPFilter '(lDAPDisplayName=msLAPS-PasswordExpirationTime)' `
+                            -Properties schemaIDGUID @ad -ErrorAction Stop
+                        if ($attribute) { $script:LapsExpirationTimeGuid = [guid]$attribute.schemaIDGUID }
+                    }
+
+                    if ($script:LapsExpirationTimeGuid) {
+                        $ouSecurity = (Get-ADObject -Identity $targetDn -Properties nTSecurityDescriptor @ad -ErrorAction Stop).nTSecurityDescriptor
+
+                        foreach ($ace in $ouSecurity.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+                            if ($ace.IdentityReference.Value -ne $principal.SID.Value) { continue }
+                            if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                            if (($ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty) -eq 0) { continue }
+                            # The cmdlet writes an ACE scoped to the attribute; an unscoped
+                            # WriteProperty (empty ObjectType) covers it as well.
+                            if ($ace.ObjectType -ne $script:LapsExpirationTimeGuid -and $ace.ObjectType -ne [guid]::Empty) { continue }
+                            $present = $true
+                            break
+                        }
+                    }
+                }
+                catch {
+                    Write-TierLog -Message "Existing LAPS reset permission on $targetDn could not be read - it will be re-applied: $($_.Exception.Message)" -Level Warning
+                }
+            }
+
+            if ($present) {
                 Write-TierLog -Message "LAPS $($permission.Kind.ToLower()) permission already granted to $($permission.Group) on $targetDn" -Level Skip
                 Add-TierAction -Phase 'LAPS' -ObjectType "Laps$($permission.Kind)Permission" -Target "$($permission.Group) on $targetDn" -Result 'Compliant'
                 continue
@@ -5126,6 +5172,84 @@ function Invoke-TierModelSync {
     return $summary
 }
 
+function Get-TierUntrustedPathWriter {
+    <#
+        .SYNOPSIS
+        Lists principals outside the administrative set that can modify a file or directory.
+
+        .DESCRIPTION
+        The scheduled task runs whatever sits at the script and configuration path as SYSTEM on
+        a domain controller. Anyone who can write to those files - or to the directories that
+        contain them, because a writable parent means the file can be swapped - therefore owns
+        the domain at 03:30 the next morning. This check finds exactly those principals.
+
+        Trusted by definition: SYSTEM, the built-in Administrators, TrustedInstaller, and the
+        Domain/Enterprise Admins RIDs of any domain SID. Everything else holding a write-capable
+        allow ACE, or owning the object outright (an owner can rewrite the DACL), is reported.
+
+        Deny ACEs are ignored, so a principal that is allowed and denied at the same time is
+        still reported - a false positive in the safe direction.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Path)
+
+    $trustedSids = @(
+        'S-1-5-18',                                                          # SYSTEM
+        'S-1-5-32-544',                                                      # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'     # TrustedInstaller
+    )
+
+    # Write-capable in the sense of 'can change what the task executes': content, deletion
+    # (replace after delete), the DACL itself, or ownership.
+    $writeMask = [System.Security.AccessControl.FileSystemRights](
+        [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+
+    $isTrusted = {
+        param([System.Security.Principal.SecurityIdentifier]$Sid)
+        if ($trustedSids -contains $Sid.Value) { return $true }
+        # Domain Admins (-512) and Enterprise Admins (-519) of whatever domain the file came
+        # from - matched by RID so this works for member servers of a child domain as well.
+        if ($Sid.Value -match '^S-1-5-21-\d+-\d+-\d+-(512|519)$') { return $true }
+        return $false
+    }
+
+    $findings = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($item in ($Path | Sort-Object -Unique)) {
+        try {
+            $acl = Get-Acl -LiteralPath $item -ErrorAction Stop
+        }
+        catch {
+            $findings.Add("$item : ACL could not be read - $($_.Exception.Message)")
+            continue
+        }
+
+        $owner = $null
+        try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]) } catch { }
+        if ($owner -and -not (& $isTrusted $owner)) {
+            $ownerName = try { $acl.Owner } catch { $owner.Value }
+            $findings.Add("$item : owned by $ownerName - the owner can rewrite the permissions")
+        }
+
+        foreach ($ace in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            if (($ace.FileSystemRights -band $writeMask) -eq 0) { continue }
+            if (& $isTrusted $ace.IdentityReference) { continue }
+
+            $name = $ace.IdentityReference.Value
+            try { $name = $ace.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value } catch { }
+            $findings.Add("$item : $name holds $($ace.FileSystemRights)")
+        }
+    }
+
+    return $findings.ToArray()
+}
+
 function Install-TierModelScheduledTask {
     <#
         .SYNOPSIS
@@ -5135,6 +5259,12 @@ function Install-TierModelScheduledTask {
         Without this the silo membership is only ever as current as the last manual run. The task
         runs as SYSTEM on a domain controller, which already has the rights it needs, and writes
         its result into the event log like every other run.
+
+        Before registering, the ACLs of the script, the configuration and their directories are
+        checked: nobody outside SYSTEM, Administrators, TrustedInstaller and the Domain and
+        Enterprise Admins may be able to modify them. A tier model whose sync script is writable
+        by a Tier 1 operator is a privilege escalation to SYSTEM on a domain controller with a
+        daily trigger. -SkipAclCheck bypasses the check for environments that accept the risk.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -5142,7 +5272,8 @@ function Install-TierModelScheduledTask {
         [Parameter(Mandatory)][string]$ConfigurationPath,
         [string]$TaskName = 'ADTierKit Membership Sync',
         [string]$TaskPath = '\ADTierKit\',
-        [string]$At = '03:30'
+        [string]$At = '03:30',
+        [switch]$SkipAclCheck
     )
 
     if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "Script not found: $ScriptPath" }
@@ -5150,6 +5281,29 @@ function Install-TierModelScheduledTask {
 
     $scriptFull = (Resolve-Path -LiteralPath $ScriptPath).Path
     $configFull = (Resolve-Path -LiteralPath $ConfigurationPath).Path
+
+    if (-not $SkipAclCheck) {
+        $checkedPaths = @(
+            $scriptFull, $configFull,
+            (Split-Path $scriptFull -Parent), (Split-Path $configFull -Parent)
+        )
+        $writers = Get-TierUntrustedPathWriter -Path $checkedPaths
+
+        if ($writers.Count -gt 0) {
+            foreach ($writer in $writers) {
+                Write-TierLog -Message "Scheduled task refused: $writer" -Level Error
+            }
+            throw ("The sync task would run these files as SYSTEM on a domain controller, but they are modifiable " +
+                "by principals outside the administrative set (see above). Move ADTierKit to a directory only " +
+                "administrators can write to - for example under Program Files - and register the task again, " +
+                "or pass -SkipAclCheck to accept the risk deliberately.")
+        }
+
+        Write-TierLog -Message 'Script and configuration paths are writable only by the administrative set' -Level Info
+    }
+    else {
+        Write-TierLog -Message 'ACL check on the script and configuration paths was skipped (-SkipAclCheck)' -Level Warning
+    }
 
     # Log and report directories are passed explicitly. Under SYSTEM the working directory is
     # not the script folder, and a run whose output lands in C:\Windows\System32 is a run nobody

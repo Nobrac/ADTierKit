@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-08-24
+
+Hardening and documentation release. The three code changes came out of an external review of
+1.0.0; none of them changes what a converged directory looks like — two close gaps in how the
+tool protects and checks itself, one removes report noise.
+
+### Security
+
+- **`InstallTask` now refuses paths that principals outside the administrative set can
+  modify.** The sync task executes the script and the configuration as SYSTEM on a domain
+  controller — whoever can write to those files, or to the directories containing them, owns
+  the domain at 03:30. The new `Get-TierUntrustedPathWriter` check inspects allow ACEs
+  (write, delete, permission and ownership rights) and the object owner on all four paths,
+  trusting only SYSTEM, `Administrators`, `TrustedInstaller` and the Domain/Enterprise Admins
+  RIDs, and registration fails with the offending principals named. `-SkipAclCheck` bypasses
+  it deliberately. Existing installations are unaffected until the task is registered again.
+
+### Fixed
+
+- **The password shuffle no longer has a modulo bias.** Character *picks* already used
+  rejection sampling; the Fisher-Yates shuffle behind them still used a plain modulo, which
+  biases positions slightly whenever 256 is not divisible by the remaining length. Both now
+  draw from the same rejection-sampled source. No practical weakness — the characters
+  themselves were always uniform — but the code now does what its own comment promised.
+
+- **LAPS reset permissions are idempotent.** `Find-LapsADExtendedRights` reports read-permission
+  holders only; the reset grant is `WriteProperty` on `msLAPS-PasswordExpirationTime` and never
+  appears there, so every run re-granted it and reported `Created`. The reset side is now
+  checked against the OU ACL directly — the same technique the computer self permission already
+  used, for the same reason.
+
+### Added
+
+- **`docs/OPERATIONS.md`** — the operator's guide: the working model (converge, plan-first,
+  additive), the complete change inventory with every default value the tool writes, day-two
+  operations, the rollout playbook with per-phase checks, the pitfalls, and a verification
+  checklist.
+
+- **README: "What belongs in Tier 0."** The tool secures the boundary the configuration
+  declares; this section is the classification test (control, not importance) and the usual
+  omissions — PKI, Entra Connect, backup infrastructure, hypervisors hosting DCs, endpoint
+  management that reaches DCs, and the kit's own directory.
+
+- **README: silo pre-enforcement warning.** The PAWs must be inside `memberComputerOus` and
+  synced before enforcement, and the `AuthenticationPolicyFailures-DomainController` log —
+  where the audit-phase denials land — is disabled by default and must be enabled on every
+  domain controller, or a clean audit phase proves nothing.
+
 ## [1.0.0] — 2026-08-14
 
 First tagged release. Everything below has been deployed and exercised against a Windows Server

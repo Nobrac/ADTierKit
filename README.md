@@ -92,7 +92,11 @@ folder structure to preserve, no build step. Copy two files onto a domain contro
 | [Guardrails](#guardrails) | [Design decisions](#design-decisions-worth-knowing) | [Checking the code](#checking-the-code) |
 | [Prerequisites](#prerequisites) | [Configuration reference](#configuration-reference) | [Limitations & notes](#limitations--notes) |
 | [Quick start](#quick-start) | [Reports and logging](#reports-and-logging) | [Repository layout](#repository-layout) |
-| [Rollout order](#recommended-rollout-order) | | [License](#license) |
+| [What belongs in Tier 0](#what-belongs-in-tier-0) | | [License](#license) |
+| [Rollout order](#recommended-rollout-order) | | |
+
+For the full walkthrough — every setting the tool writes, the day-to-day working model and the
+complete rollout playbook — see the **[Operator's Guide](docs/OPERATIONS.md)**.
 
 ---
 
@@ -468,6 +472,34 @@ Afterwards you get a full preview — OU tree, every group, accounts, GPOs, LAPS
 
 ---
 
+## What belongs in Tier 0
+
+The tool secures whatever the configuration declares as Tier 0. Declaring it correctly is the one
+step no tool can do for you — and it is the step most tier deployments get wrong, because Tier 0
+is larger than "the domain controllers".
+
+The test is **control, not importance**: anything that can modify a domain controller, the
+credentials stored on it, or the policy that reaches it *is* Tier 0, whichever OU it lives in
+today. In most environments that list includes:
+
+| System | Why it is Tier 0 |
+| --- | --- |
+| **AD Certificate Services** | A CA that issues logon-capable certificates can mint a domain controller identity. Every ESC-class attack is a Tier 0 compromise through a "Tier 1" server. |
+| **Entra Connect / AAD Connect** | Holds the password-hash-sync credentials and an account with directory-wide replication rights. |
+| **Backup infrastructure** | Whoever can read a domain controller system state backup holds `NTDS.dit` — every hash in the domain. The backup server, its service account and its storage are all in scope. |
+| **Hypervisors hosting DC VMs** | A host administrator can read DC disks and memory, snapshot credentials, or attach a rogue disk. The virtualisation management plane (vCenter, SCVMM) comes with it. |
+| **Endpoint management that reaches DCs** | SCCM/MECM, patch management, EDR consoles with live response — anything that executes code on a DC by design. |
+| **Script and installation shares** | A share referenced by a GPO startup script or scheduled task on Tier 0 machines is writable code execution on Tier 0. |
+| **Privileged access workstations** | The machines Tier 0 administrators type their credentials into. |
+| **The ADTierKit directory itself** | Once the sync task is registered, whoever can edit `ADTierKit.ps1` or `tiermodel.json` runs as SYSTEM on a domain controller at 03:30. The `InstallTask` mode refuses paths writable outside the administrative set for exactly this reason. |
+
+Work through the list before step 2 of the rollout: move these machines into `Tier-0/Servers` (or
+`Devices` for the workstations) and their administrators into the Tier 0 role groups. A tier
+boundary with the backup server on the wrong side of it is decoration — the deny rights will be
+perfectly enforced around a hole.
+
+---
+
 ## Recommended rollout order
 
 Deploying tiering in one shot is how people lock themselves out.
@@ -490,6 +522,17 @@ Deploying tiering in one shot is how people lock themselves out.
 5. **Verify a fresh logon** — with a second session already open, apply the policy, run `gpupdate /force`, and confirm a *new* logon works in a third session before closing the second.
 6. **Enforce** — populate the deny groups and let the GPOs apply to the full tier OUs.
 7. **Silo enforcement** — flip `authenticationPolicyEnforcement` from `Audit` to `Enforce` only after event IDs 4820 / 4821 have been clean for a few weeks.
+
+> **Before any silo enforcement:** the workstations your Tier 0 administrators actually work
+> from must sit inside the OUs listed in `memberComputerOus` (by default `Tier-0/Devices` and
+> `Tier-0/Servers`) and have been picked up by a `Sync` run. An enforced silo allows
+> authentication **only from silo members** — a T0 admin whose PAW was never moved in can no
+> longer log on anywhere except the domain controller console. The audit phase exists to catch
+> exactly this: every 4820/4821 event names an account that would have been refused, so a clean
+> event log *is* the proof that the PAWs are in. Note that the log these failures land in —
+> `AuthenticationPolicyFailures-DomainController` under *Applications and Services Logs →
+> Microsoft → Windows → Authentication* — is **disabled by default**: enable it on every domain
+> controller before starting the audit phase, or a clean log proves nothing.
 
 Keep at least one break-glass account **outside** the silo and outside `Protected Users`. The generated configuration does this via `"excludeFromSilo": true`.
 
@@ -821,6 +864,7 @@ config/roles.example.json     ready-made DNS and Group Policy roles to copy in
 Update-TierConfiguration.ps1  brings a pre-1.0 configuration up to the current schema
 tests/                        offline test suites — no domain required
 docs/                         screenshots used by this README
+docs/OPERATIONS.md            the operator's guide — every setting, the working model, the playbook
 Logs/                         per-run transcript, created on first run
 Reports/                      JSON + HTML reports
 Credentials/                  DPAPI-encrypted passwords of generated accounts
