@@ -14,9 +14,12 @@
          silently drops Account, Server, Print and Backup Operators and Enterprise Domain
          Controllers.
 
-      3. Re-checks every deny group for critical identities - the account running this script,
-         RID 500, and the members of Domain Admins - and reports whether re-enabling the tier
-         GPOs would be safe.
+      3. Re-checks the deny groups of the GPOs that reach this domain controller (the Domain
+         Controllers OU, or wherever this machine sits) for critical identities - the account
+         running this script, RID 500, and the members of Domain Admins - and reports whether
+         re-enabling the tier GPOs would be safe. The deny groups of the other tiers are not
+         checked: they contain the top tier role group by design, so every Domain Admin shows up
+         in them, and a check that fires on every correctly configured domain can never pass.
 
     The GPO links stay disabled unless -EnableGpoLinks is passed. Re-enabling them is the one
     irreversible-feeling step, so it is a deliberate act and only runs when step 3 came back clean.
@@ -50,12 +53,20 @@
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string]$ConfigurationPath = (Join-Path $PSScriptRoot 'config\tiermodel.json'),
+    # Default: config\tiermodel.json next to this script.
+    [string]$ConfigurationPath,
     [switch]$SkipUserRightsRestore,
     [switch]$EnableGpoLinks
 )
 
 $ErrorActionPreference = 'Stop'
+
+# $PSScriptRoot is empty while parameter defaults are bound under Windows PowerShell 5.1 (-File),
+# so the script folder is resolved here, after binding, with two fallbacks.
+$scriptRoot = $PSScriptRoot
+if (-not $scriptRoot -and $MyInvocation.MyCommand.Path) { $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $scriptRoot) { $scriptRoot = (Get-Location).Path }
+if (-not $ConfigurationPath) { $ConfigurationPath = Join-Path $scriptRoot 'config\tiermodel.json' }
 
 function Write-Step {
     param([string]$Text, [string]$Level = 'Info')
@@ -120,6 +131,53 @@ foreach ($tier in $config.tiers) {
 Write-Step "Tier role groups: $($roleGroupNames -join ', ')"
 Write-Step "Deny groups: $($denyGroupNames -join ', ')"
 
+$links = @()
+# The configuration calls this key 'rootOu'. Guessing the name once produced 'OU=,DC=...',
+# which ADSI rejects with 0x80005000 - so it is read defensively and verified.
+$rootOuName = $config.domain.rootOu
+if ([string]::IsNullOrWhiteSpace($rootOuName)) {
+    throw "The configuration has no domain.rootOu value - cannot determine the tier model root."
+}
+$rootDn = "OU=$rootOuName,$($domain.DistinguishedName)"
+foreach ($tier in $config.tiers) {
+    foreach ($gpo in @($tier.gpos)) {
+        $target = if ($gpo.targetOu -eq '$DomainControllers') { $domain.DomainControllersContainer }
+        elseif ($gpo.targetOu -eq '$ModelRoot') { $rootDn }
+        elseif ([string]::IsNullOrWhiteSpace($gpo.targetOu)) { "OU=$($tier.name),$rootDn" }
+        elseif ($gpo.targetOu -match '^(OU|CN|DC)=') { $gpo.targetOu }
+        elseif ($gpo.targetOu -like '*/*') {
+            $segments = @($gpo.targetOu.Split('/') | Where-Object { $_ })
+            [array]::Reverse($segments)
+            (($segments | ForEach-Object { "OU=$_" }) -join ',') + ",$rootDn"
+        }
+        else { "OU=$($gpo.targetOu),OU=$($tier.name),$rootDn" }
+        $exists = $null -ne (Get-ADObject -Filter "distinguishedName -eq '$target'" -ErrorAction SilentlyContinue)
+
+        # Deny groups of this GPO - needed for the lockout re-check below.
+        $gpoDenyGroups = @()
+        foreach ($right in ($gpo.userRights.PSObject.Properties.Name | Where-Object { $_ -like 'SeDeny*Logon*' })) {
+            $gpoDenyGroups += @($gpo.userRights.$right | Where-Object { $_ -and $_ -notlike 'S-1-*' })
+        }
+
+        $links += [pscustomobject]@{
+            Name       = $gpo.name
+            Target     = $target
+            Exists     = $exists
+            DenyGroups = @($gpoDenyGroups | Sort-Object -Unique)
+        }
+    }
+}
+
+# The machines whose logon has to survive: the Domain Controllers OU and this computer.
+$protectedTargets = @($domain.DomainControllersContainer)
+try { $protectedTargets += (Get-ADComputer -Identity $env:COMPUTERNAME -ErrorAction Stop).DistinguishedName }
+catch { Write-Step 'This machine was not found in the directory - only the Domain Controllers OU is considered' -Level Warn }
+
+$reachingLinks = @($links | Where-Object {
+        $linkTarget = $_.Target
+        @($protectedTargets | Where-Object { $_ -eq $linkTarget -or $_ -like "*,$linkTarget" }).Count -gt 0
+    })
+
 # ---------------------------------------------------------------------------------------------
 # 1. Remove the built-in Administrator from the tier role groups
 # ---------------------------------------------------------------------------------------------
@@ -162,6 +220,21 @@ elseif (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Restore the default log
     Write-Step 'Would restore the default holders of the interactive logon rights'
 }
 else {
+    # secedit only changes the local database. A tier GPO that still applies here writes its deny
+    # entries back at the next policy refresh - on a domain controller within five minutes.
+    if (Get-Command Get-GPInheritance -ErrorAction SilentlyContinue) {
+        foreach ($link in ($reachingLinks | Where-Object Exists)) {
+            try {
+                $inheritance = Get-GPInheritance -Target $link.Target -Domain $domain.DNSRoot -ErrorAction Stop
+                $live = $inheritance.GpoLinks | Where-Object { $_.DisplayName -eq $link.Name -and $_.Enabled }
+                if ($live) {
+                    Write-Step "$($link.Name) is still linked and enabled on $($link.Target) - disable the link first, or the next policy refresh undoes this step" -Level Warn
+                }
+            }
+            catch { Write-Step "Link state of $($link.Name) could not be read - $($_.Exception.Message)" -Level Warn }
+        }
+    }
+
     # The Windows default on a domain controller. Administrators plus the four operator groups
     # and Enterprise Domain Controllers for interactive logon; Administrators for remote.
     # The deny entries are cleared: the tier model re-applies them once the GPOs are back on.
@@ -226,14 +299,17 @@ if ($domainAdmins) {
     }
 }
 
+$reachingDenyGroups = @($reachingLinks | ForEach-Object { $_.DenyGroups } | Where-Object { $_ } | Sort-Object -Unique)
+Write-Step "GPOs reaching this machine: $(if ($reachingLinks) { ($reachingLinks.Name -join ', ') } else { 'none' })"
+
 $problems = [System.Collections.Generic.List[string]]::new()
-foreach ($groupName in $denyGroupNames) {
+foreach ($groupName in $reachingDenyGroups) {
     $group = Get-ADGroup -LDAPFilter "(sAMAccountName=$groupName)" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $group) { continue }
 
     foreach ($member in @(Get-ADGroupMember -Identity $group.DistinguishedName -Recursive -ErrorAction SilentlyContinue)) {
         if ($critical.ContainsKey($member.SID.Value)) {
-            $problems.Add("$groupName still contains $($critical[$member.SID.Value])")
+            $problems.Add("$groupName (denied on this machine) still contains $($critical[$member.SID.Value])")
         }
     }
 }
@@ -250,24 +326,6 @@ else {
 # 4. Optionally re-enable the GPO links
 # ---------------------------------------------------------------------------------------------
 Write-Step '--- Step 4: GPO links ---' -Level Head
-
-$links = @()
-# The configuration calls this key 'rootOu'. Guessing the name once produced 'OU=,DC=...',
-# which ADSI rejects with 0x80005000 - so it is read defensively and verified.
-$rootOuName = $config.domain.rootOu
-if ([string]::IsNullOrWhiteSpace($rootOuName)) {
-    throw "The configuration has no domain.rootOu value - cannot determine the tier model root."
-}
-$rootDn = "OU=$rootOuName,$($domain.DistinguishedName)"
-foreach ($tier in $config.tiers) {
-    foreach ($gpo in @($tier.gpos)) {
-        $target = if ($gpo.targetOu -eq '$DomainControllers') { $domain.DomainControllersContainer }
-        elseif ([string]::IsNullOrWhiteSpace($gpo.targetOu)) { "OU=$($tier.name),$rootDn" }
-        else { "OU=$($gpo.targetOu),OU=$($tier.name),$rootDn" }
-        $exists = $null -ne (Get-ADObject -Filter "distinguishedName -eq '$target'" -ErrorAction SilentlyContinue)
-        $links += [pscustomobject]@{ Name = $gpo.name; Target = $target; Exists = $exists }
-    }
-}
 
 if (-not $EnableGpoLinks) {
     Write-Step 'Links left disabled. Re-run with -EnableGpoLinks once you are ready:'

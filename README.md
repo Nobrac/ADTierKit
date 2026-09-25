@@ -106,14 +106,14 @@ complete rollout playbook — see the **[Operator's Guide](docs/OPERATIONS.md)**
 | --- | :---: | --- |
 | `.\ADTierKit.ps1` | ⚠️ | **Interactive wizard.** Asks for the naming convention, previews the result, writes the configuration, optionally starts the deployment. Start here. |
 | `.\ADTierKit.ps1 -Mode Deploy` | ⚠️ | Applies the configuration. **Plans by default** — writes only with `-Apply`. Staged rollout via `-Stage`. |
-| `.\ADTierKit.ps1 -Mode Audit` | — | Read-only drift and hygiene report with severity classification. |
+| `.\ADTierKit.ps1 -Mode Audit` | — | Read-only drift and hygiene report with severity classification, including the attack paths into Tier 0 that lie outside the model (DCSync rights, dangerous ACEs, editable Tier 0 GPOs, RBCD, Kerberoastable admins, krbtgt age). |
 | `.\ADTierKit.ps1 -Mode Sync` | ✅ | Re-runs only the membership stages. Safe to schedule. |
-| `.\ADTierKit.ps1 -Mode InstallTask` | ✅ | Registers a daily scheduled task that runs `Sync` as SYSTEM. |
+| `.\ADTierKit.ps1 -Mode InstallTask` | ✅ | Registers a daily scheduled task that runs `Sync` as SYSTEM. `-RequireSignedScript` runs it under `AllSigned`, `-PinConfiguration` makes it refuse a changed configuration. |
 | `.\ADTierKit.ps1 -Mode Check` | — | Prerequisite check only. |
 
 ⚠️ needs `-Apply` before anything is written · ✅ writes to the directory · — read-only
 
-**Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` deploy failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` high severity findings
+**Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` deploy failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` high severity findings &nbsp;·&nbsp; `5` pinned configuration changed
 
 ---
 
@@ -121,9 +121,10 @@ complete rollout playbook — see the **[Operator's Guide](docs/OPERATIONS.md)**
 
 ```
 OU=Tiering
+├── OU=Staging                    neutral landing zone — new computers, administered by no tier
 ├── OU=Tier-0                     control plane — domain controllers, PKI, identity
 │   ├── OU=Accounts               adm-t0-*, break glass
-│   ├── OU=Groups                 G-T0-Admins · G-T0-Operators · DL-T0-*
+│   ├── OU=Groups                 G-T0-Admins · G-T0-Operators · DL-T0-* · every tier's DenyLogon / Exempt-Logon
 │   ├── OU=Servers                Tier 0 member servers
 │   ├── OU=Devices                privileged access workstations
 │   ├── OU=Service-Accounts
@@ -148,7 +149,7 @@ OU=Tiering
 | `GPO` | Per-tier logon restriction GPOs: deny rights for foreign-tier principals, restricted groups for local `Administrators` and `Remote Desktop Users`, UNC hardened paths, plus an exception group per GPO. |
 | `Laps` | Windows LAPS: schema extension, per-tier read and reset permissions, and one policy GPO per tier with its own decryption principal. |
 | `KDS` | KDS root key, the prerequisite for gMSA and dMSA. |
-| `Silo` | One Kerberos authentication policy and silo per administrative tier. Deployed in audit mode by default. |
+| `Silo` | One Kerberos authentication policy and silo per administrative tier. Deployed in audit mode by default; enforcement is withheld until Kerberos armoring is in place. Membership is reconciled both ways, and an account that qualifies for two silos is reported rather than moved back and forth. |
 
 <table>
 <tr>
@@ -391,6 +392,8 @@ severity finding, which catches a membership added *after* deployment.
 | **The Recycle Bin goes first** | The first stage enables the AD Recycle Bin, so a mistake later in the same run is recoverable without an authoritative restore. |
 | **Tattooing is stated out loud** | Every run warns, before writing logon rights, that disabling the link later will not give a removed right back. |
 | **Silos start in audit mode** | Authentication policy silos deploy with enforcement off, so you can watch events 4820 / 4821 before anything is actually denied. |
+| **No enforcement without armoring** | An enforced silo needs Kerberos armoring on the KDC and on the clients, or it refuses logons for the wrong reason. The generated GPOs carry both settings (level *Supported*), and the Silo stage withholds enforcement until they are configured and deployed — `-Force` overrides. |
+| **New machines belong to nobody** | Computers joined without a pre-staged object land in `OU=Staging` below the model root, where every tier's administrators are denied logon and only a join group and the top tier hold rights — not in a tier whose administrators would then own a machine that may turn out to be Tier 0. |
 | **Break-glass stays outside** | The generated break-glass account is excluded from the silo and from `Protected Users` by design. |
 | **No silent failures** | Every failure path writes to the log, not just to the report object. A problem that only shows up as a number in the summary is a problem nobody finds. |
 
@@ -592,9 +595,17 @@ run compares every ACE and reports it compliant or missing.
 Deployment is a one-off event; membership is not. A server moved into a tier OU next month does not join the authentication silo on its own, and nothing in the directory notices.
 
 ```powershell
-.\ADTierKit.ps1 -Mode Sync          # group nesting + silo assignment, nothing else
+.\ADTierKit.ps1 -Mode Sync          # nesting, account hygiene, silo assignment, ownership
 .\ADTierKit.ps1 -Mode InstallTask   # daily at 03:30 as SYSTEM
+.\ADTierKit.ps1 -Mode InstallTask -RequireSignedScript -PinConfiguration   # hardened
 ```
+
+`-RequireSignedScript` registers the task with `ExecutionPolicy AllSigned` after checking that
+the script carries a valid signature from a publisher in `LocalMachine\TrustedPublisher`, so a
+modified script does not run even for someone who managed to write it. `-PinConfiguration`
+passes the configuration's SHA256 to the task; a changed file makes the run stop with exit code
+`5` and event 1003 until the task is registered again - every configuration change becomes a
+deliberate re-approval.
 
 ---
 
@@ -623,6 +634,8 @@ Used anywhere a `targetOu` appears:
 | `"Servers"` | `OU=Servers,OU=<tier>,<model root>` |
 | `"Tier-1/Servers"` | explicit path below the model root |
 | `"$DomainRoot"` | the domain naming context |
+| `"$Staging"` | the neutral landing zone below the model root (requires an enabled `staging` block) |
+| `"$ModelRoot"` | the model root OU |
 | `"$DomainControllers"` | `OU=Domain Controllers,<domain>` |
 | `"$SystemContainer"` | `CN=System,<domain>` |
 | `"$MicrosoftDns"` | `CN=MicrosoftDNS,CN=System,<domain>` — the DNS server object |
@@ -642,7 +655,10 @@ Used anywhere a `targetOu` appears:
 | `blockGpoInheritanceOnTierRoots` | Blocks Group Policy inheritance per tier, so the Default Domain Policy does not leak into Tier 0. |
 | `gpos[].linkEnabled` | Per GPO: `false` keeps it linked but inactive, and a later deployment respects that instead of switching it back on. |
 | `restrictedGroupsMode` | `MemberOf` (additive) or `Replace` (strict). |
-| `authenticationPolicyEnforcement` | `Audit` or `Enforce`. |
+| `authenticationPolicyEnforcement` | `Audit` or `Enforce`. Converged on existing policies and silos; `Enforce` is withheld while Kerberos armoring is missing. |
+| `authenticationPolicySiloReconcile` | `Report` (default) lists silo members that no longer qualify; `Enforce` removes them. |
+| `staging` | The neutral landing zone. Expanded at load time into a deny logon group (every role group of every tier), a join group, delegation, a quarantine GPO and a LAPS policy. Point `redirectComputersTo` at `$Staging` to use it. |
+| `attackPathChecks` | Audit only: `enabled`, `trustedPrincipals` (principals that legitimately hold Tier 0 rights, e.g. Entra Connect once it lives in Tier 0), `krbtgtMaxAgeDays`, `maxObjects`. |
 | `ownership.mode` | `Report` (default) or `Enforce`. See [Ownership](#ownership). |
 | `roles` | Role definitions. Expanded at load time into groups, accounts, ACEs, deny nesting and silo membership. See [Roles](#roles). |
 | `builtInNesting` | Generated by role expansion. Nests a group into a built-in group such as `DnsAdmins`, additively. |
@@ -662,6 +678,8 @@ the wizard or edit those sections directly.
 Every run writes a timestamped log to `.\Logs`, a JSON + HTML report to `.\Reports`, and a summary to the Windows Application event log (source `ADTierKit`, event IDs 1000 clean / 1001 medium findings / 1002 high findings or failures). Suppress the last one with `-NoEventLog`.
 
 The HTML report is a single self-contained file — clickable severity filters, full-text search, sticky header, dark mode. No external dependencies, so it survives being emailed.
+
+Each report is compared with the previous report of the same mode in the same folder. Findings that were not there last time are marked **new** and get their own filter; findings that disappeared are listed as *resolved*. The event log entry carries both counts - for a daily sync, that is the part worth reading.
 
 Findings are classified so a report can be triaged from the top instead of read line by line:
 
@@ -733,8 +751,9 @@ Four steps, each reported before and after: remove the built-in Administrator fr
 group (names taken from your configuration, nothing outside them touched); restore the default
 holders of the interactive logon rights and clear the deny entries, exporting the result rather
 than assuming it — `-SkipUserRightsRestore` keeps an Administrators-only setting instead; re-check
-every deny group recursively against the running account, the built-in Administrator and `Domain
-Admins`; and re-enable the GPO links, only with `-EnableGpoLinks` and only if the check was clean.
+the deny groups of the GPOs that reach this domain controller recursively against the running
+account, the built-in Administrator and `Domain Admins` (the other tiers' deny groups contain the
+top tier by design and are not a lockout risk here); and re-enable the GPO links, only with `-EnableGpoLinks` and only if the check was clean.
 
 ### The manual way back
 
@@ -811,7 +830,12 @@ in a third session. If it fails, recovery is a two-minute job instead of an even
 ```powershell
 Install-Module PSScriptAnalyzer -Scope CurrentUser
 Invoke-ScriptAnalyzer -Path .\ADTierKit.ps1 -Severity Error
+.\tests\Invoke-AllTests.ps1
 ```
+
+The same runs on every push and pull request in GitHub Actions (`.github/workflows/ci.yml`):
+parse check, JSON validation, PSScriptAnalyzer (errors fail the build, warnings become
+annotations) and the offline suites on PowerShell 7 and on Windows PowerShell 5.1.
 
 No errors as of the last commit. Running without `-Severity` adds a few hundred style findings
 that are deliberate here and can be ignored:
@@ -863,6 +887,8 @@ config/tiermodel.json         your configuration — the source of truth
 config/roles.example.json     ready-made DNS and Group Policy roles to copy in
 Update-TierConfiguration.ps1  brings a pre-1.0 configuration up to the current schema
 tests/                        offline test suites — no domain required
+lab/Test-LogonMatrix.ps1      logs on with test accounts and checks the tier boundary on a real machine
+.github/workflows/ci.yml      parse, analyzer and offline tests on every push
 docs/                         screenshots used by this README
 docs/OPERATIONS.md            the operator's guide — every setting, the working model, the playbook
 Logs/                         per-run transcript, created on first run

@@ -1,0 +1,85 @@
+name: CI
+
+# Offline checks only: the suites mock Active Directory and Group Policy, so they need neither a
+# domain nor the RSAT modules. What they cannot cover is how a real domain controller behaves -
+# a green run means the logic still does what the tests say, not that a deployment will work.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Parse, JSON and PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every script
+        shell: pwsh
+        run: |
+          $failed = 0
+          foreach ($file in Get-ChildItem -Recurse -Filter *.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) {
+              Write-Host "::error file=$($file.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $failed++
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Validate JSON configuration
+        shell: pwsh
+        run: |
+          foreach ($file in Get-ChildItem config -Filter *.json) {
+            try { Get-Content $file.FullName -Raw | ConvertFrom-Json | Out-Null; Write-Host "$($file.Name) OK" }
+            catch { Write-Host "::error file=$($file.FullName)::$($_.Exception.Message)"; exit 1 }
+          }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.23.0 -Scope CurrentUser -Force
+          # Errors fail the build. Warnings are reported as annotations; the style rules that the
+          # project deliberately does not follow (Write-Host in an interactive tool, plural nouns,
+          # declared output types) are left out so the real ones stay visible.
+          $excluded = 'PSAvoidUsingWriteHost', 'PSUseSingularNouns', 'PSUseOutputTypeCorrectly',
+                      'PSUseShouldProcessForStateChangingFunctions', 'PSAvoidUsingPositionalParameters',
+                      'PSReviewUnusedParameter'
+          $results = Get-ChildItem -Recurse -Filter *.ps1 |
+            ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -ExcludeRule $excluded }
+          foreach ($r in $results) {
+            $level = if ($r.Severity -eq 'Error' -or $r.Severity -eq 'ParseError') { 'error' } else { 'warning' }
+            Write-Host "::$level file=$($r.ScriptPath),line=$($r.Line)::[$($r.RuleName)] $($r.Message)"
+          }
+          if (@($results | Where-Object { $_.Severity -in 'Error', 'ParseError' }).Count -gt 0) { exit 1 }
+
+  test-pwsh:
+    name: Offline tests (PowerShell 7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all suites
+        shell: pwsh
+        run: ./tests/Invoke-AllTests.ps1
+
+  test-windows-powershell:
+    # The tool targets Windows PowerShell 5.1, which is what ships on a domain controller and is
+    # stricter than 7 in places (empty collections bound to typed parameters, for one).
+    name: Offline tests (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all suites
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion
+          .\tests\Invoke-AllTests.ps1
+          exit $LASTEXITCODE

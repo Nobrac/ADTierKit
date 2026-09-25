@@ -19,6 +19,9 @@ $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]
 $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
 foreach ($f in $functions) { . ([scriptblock]::Create($f.Extent.Text)) }
 
+# Every directory command fails loudly unless a mock below replaces it - see TestIsolation.ps1.
+. (Join-Path $PSScriptRoot 'TestIsolation.ps1')
+
 # --- state ---------------------------------------------------------------------------------------
 $script:TierActions = [System.Collections.Generic.List[object]]::new()
 $script:PrincipalCache = @{}

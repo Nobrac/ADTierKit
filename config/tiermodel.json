@@ -20,7 +20,7 @@
     "addTier0AdminsToProtectedUsers": true,
     "enableAdRecycleBin": true,
     "machineAccountQuota": 0,
-    "redirectComputersTo": "Tier-2/Staging",
+    "redirectComputersTo": "$Staging",
     "redirectUsersTo": null,
     "enableSiteLinkNotification": true,
     "deployWindowsLaps": true,
@@ -32,6 +32,7 @@
     "enforceGpoLinks": true,
     "createAuthenticationPolicySilo": true,
     "authenticationPolicyEnforcement": "Audit",
+    "authenticationPolicySiloReconcile": "Report",
     "tier0TgtLifetimeMinutes": 240
   },
   "tiers": [
@@ -252,15 +253,6 @@
           "inheritance": "Descendents",
           "type": "Allow",
           "comment": "Account restrictions property set - required to enable the joined account"
-        },
-        {
-          "principal": "G-T0-Operators",
-          "targetOu": "Service-Accounts",
-          "rights": "ReadProperty, ExtendedRight",
-          "objectType": null,
-          "inheritance": "All",
-          "type": "Allow",
-          "comment": "Read gMSA password blobs"
         }
       ],
       "gpos": [
@@ -324,6 +316,13 @@
               "type": "DWord",
               "value": 1,
               "comment": "LSA protected process"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Kerberos\\Parameters",
+              "valueName": "EnableCbacAndArmor",
+              "type": "DWord",
+              "value": 1,
+              "comment": "Kerberos client support for claims, compound authentication and armoring - required by authentication policy silos"
             }
           ],
           "exceptionGroup": "DL-T0-Exempt-Logon",
@@ -353,7 +352,29 @@
             ]
           },
           "restrictedGroups": {},
-          "registrySettings": [],
+          "registrySettings": [
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\KDC\\Parameters",
+              "valueName": "EnableCbacAndArmor",
+              "type": "DWord",
+              "value": 1,
+              "comment": "KDC support for claims, compound authentication and Kerberos armoring"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\KDC\\Parameters",
+              "valueName": "CbacAndArmorLevel",
+              "type": "DWord",
+              "value": 1,
+              "comment": "Supported - unarmoured requests are still answered"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Kerberos\\Parameters",
+              "valueName": "EnableCbacAndArmor",
+              "type": "DWord",
+              "value": 1,
+              "comment": "Kerberos client support for claims, compound authentication and armoring - required by authentication policy silos"
+            }
+          ],
           "allowedUserRights": {
             "SeInteractiveLogonRight": [
               "S-1-5-32-544",
@@ -434,7 +455,7 @@
         {
           "name": "DL-T1-DenyLogon",
           "scope": "DomainLocal",
-          "targetOu": "Groups",
+          "targetOu": "Tier-0/Groups",
           "description": "Principals that must never authenticate to a Tier 1 system.",
           "members": [
             "G-T0-Admins",
@@ -527,6 +548,16 @@
           "comment": "Manage every object below the Tier-1 branch - permissions on the branch itself stay out of reach"
         },
         {
+          "principal": "G-T1-Admins",
+          "targetOu": "",
+          "rights": "WriteProperty",
+          "objectType": "gPOptions",
+          "inheritedObjectType": "organizationalUnit",
+          "inheritance": "Descendents",
+          "type": "Deny",
+          "comment": "Cannot block Group Policy inheritance below the Tier-1 branch"
+        },
+        {
           "principal": "G-T1-Operators",
           "targetOu": "Servers",
           "rights": "CreateChild, DeleteChild",
@@ -575,15 +606,6 @@
           "inheritance": "Descendents",
           "type": "Allow",
           "comment": "Account restrictions property set - required to enable the joined account"
-        },
-        {
-          "principal": "G-T1-Operators",
-          "targetOu": "Service-Accounts",
-          "rights": "ReadProperty, ExtendedRight",
-          "objectType": null,
-          "inheritance": "All",
-          "type": "Allow",
-          "comment": "Read gMSA password blobs"
         }
       ],
       "gpos": [
@@ -640,10 +662,17 @@
               "type": "String",
               "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
               "comment": "UNC hardened path for logon script retrieval"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Kerberos\\Parameters",
+              "valueName": "EnableCbacAndArmor",
+              "type": "DWord",
+              "value": 1,
+              "comment": "Kerberos client support for claims, compound authentication and armoring - required by authentication policy silos"
             }
           ],
           "exceptionGroup": "DL-T1-Exempt-Logon",
-          "exceptionGroupOu": "Groups"
+          "exceptionGroupOu": "Tier-0/Groups"
         }
       ]
     },
@@ -710,7 +739,7 @@
         {
           "name": "DL-T2-DenyLogon",
           "scope": "DomainLocal",
-          "targetOu": "Groups",
+          "targetOu": "Tier-0/Groups",
           "description": "Principals that must never authenticate to a Tier 2 workstation.",
           "members": [
             "G-T0-Admins",
@@ -801,6 +830,16 @@
           "inheritance": "Descendents",
           "type": "Allow",
           "comment": "Manage every object below the Tier-2 branch - permissions on the branch itself stay out of reach"
+        },
+        {
+          "principal": "G-T2-Admins",
+          "targetOu": "",
+          "rights": "WriteProperty",
+          "objectType": "gPOptions",
+          "inheritedObjectType": "organizationalUnit",
+          "inheritance": "Descendents",
+          "type": "Deny",
+          "comment": "Cannot block Group Policy inheritance below the Tier-2 branch"
         },
         {
           "principal": "G-T2-Operators",
@@ -900,10 +939,17 @@
               "type": "String",
               "value": "RequireMutualAuthentication=1, RequireIntegrity=1",
               "comment": "UNC hardened path for logon script retrieval"
+            },
+            {
+              "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Kerberos\\Parameters",
+              "valueName": "EnableCbacAndArmor",
+              "type": "DWord",
+              "value": 1,
+              "comment": "Kerberos client support for claims, compound authentication and armoring - required by authentication policy silos"
             }
           ],
           "exceptionGroup": "DL-T2-Exempt-Logon",
-          "exceptionGroupOu": "Groups"
+          "exceptionGroupOu": "Tier-0/Groups"
         }
       ]
     }
@@ -1098,8 +1144,8 @@
         "readGroup": "G-T0-Admins",
         "resetGroup": "G-T0-Admins",
         "decryptorGroup": null,
-        "gpoName": null,
-        "comment": "Domain controllers store the DSRM password; its decryptor is always Domain Admins."
+        "gpoName": "T0-DC-LAPS",
+        "comment": "Domain controllers back up and rotate their DSRM password; its decryptor is always Domain Admins."
       },
       {
         "targetOu": "Tier-0",
@@ -1256,5 +1302,22 @@
       ],
       "includeDomainControllers": false
     }
-  ]
+  ],
+  "staging": {
+    "enabled": true,
+    "ouName": "Staging",
+    "description": "Neutral landing zone for newly joined computers. No tier administers these machines until the top tier classifies them.",
+    "administratorGroup": "G-T0-Admins",
+    "groupOu": "Tier-0/Groups",
+    "denyLogonGroup": "DL-Staging-DenyLogon",
+    "joinGroup": "DL-Staging-Join",
+    "gpoName": "Staging-Quarantine",
+    "lapsGpoName": "Staging-LAPS"
+  },
+  "attackPathChecks": {
+    "enabled": true,
+    "trustedPrincipals": [],
+    "krbtgtMaxAgeDays": 180,
+    "maxObjects": 5000
+  }
 }

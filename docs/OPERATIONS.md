@@ -57,7 +57,7 @@ The modes, for reference:
 | `.\ADTierKit.ps1 -Mode Check` | never | Prerequisite check only. Exit code `3` on failure. |
 
 Exit codes (`0` success · `1` deploy failures · `2` drift · `3` prerequisites failed · `4` high
-severity findings) are stable, so `Audit` drops into a scheduled job or a pipeline gate without
+severity findings · `5` pinned configuration changed) are stable, so `Audit` drops into a scheduled job or a pipeline gate without
 parsing the report.
 
 ---
@@ -135,6 +135,11 @@ Global role groups `G-T<x>-Admins` and `G-T<x>-Operators` (people go here), and 
 access groups `DL-T<x>-LocalAdmins`, `DL-T<x>-RemoteDesktop`, `DL-T<x>-DenyLogon` (rights attach
 here). Membership changes to a tier's access are group edits, never GPO edits.
 
+The deny logon groups of *all* tiers live in `Tier-0/Groups`. A tier's deny group protects the
+credentials of the other tiers on that tier's machines, so the tier itself must not be able to
+edit it — in its own branch, its administrators could take Tier 0 out of it. An existing group in
+the old location is moved on the next deploy.
+
 ### Nesting — the cross-tier lock
 
 Each tier's `DL-T<x>-DenyLogon` group receives the *other* tiers' role groups as members: the
@@ -157,6 +162,24 @@ Generated passwords are written to `Credentials\<sam>.xml` via `Export-Clixml` �
 bound to the creating user *and* machine. Move them into your vault and delete the files; they
 are unreadable anywhere else by design.
 
+### Staging — the neutral landing zone
+
+`OU=Staging` sits directly below the model root, outside every tier, and is where
+`redirectComputersTo: "$Staging"` sends computers joined without a pre-staged object. It is
+declared once in the `staging` block and expanded at load time:
+
+| Generated | What it does |
+| --- | --- |
+| `DL-Staging-DenyLogon` (in `Tier-0/Groups`) | Holds every global role group of every tier, generated role groups included. |
+| `Staging-Quarantine` GPO on the OU | Denies that group interactive, RDP, batch and service logon; denies local accounts network logon; hardened UNC paths. No restricted groups — nobody is added to local Administrators. |
+| `DL-Staging-Join` (in `Tier-0/Groups`) | Domain-join set on the OU (create/delete computer, reset password, DNS host name, SPN, account restrictions) and nothing else. Put whoever joins machines here. |
+| `G-T0-Admins` on the OU | Manages the staged computer objects and moves them into their tier. |
+| `Staging-LAPS` | The local administrator password of a staged machine is readable and decryptable by the top tier only. |
+
+Classifying a machine means moving it into its tier. Until then no administrative credential of
+any tier touches it — the point is that a server which turns out to be Tier 0 was never under
+Tier 2 control. The audit lists how many machines are waiting and for how long.
+
 ### Delegation — who administers what
 
 Each tier's admin group receives explicit ACEs on its own branch: `CreateChild, DeleteChild` for
@@ -164,6 +187,12 @@ the object classes that branch holds, plus `ReadProperty, WriteProperty, Delete,
 ExtendedRight, Self` on everything below — including the full domain-join permission set on the
 computer OUs. **Deliberately absent: `WriteDacl` and `WriteOwner`.** With those, a tier admin
 could rewrite the delegation that constrains them, and the boundary would be advisory.
+
+Below the top tier the branch delegation carries an explicit **deny on writing `gPOptions`** of
+sub-OUs: without it the general `WriteProperty` lets a tier admin block Group Policy inheritance
+and switch off the non-enforced policies linked at the tier root. Operators get the domain-join
+set on their computer OU and nothing on `Service-Accounts` — retrieving a gMSA password is
+granted per account through `PrincipalsAllowedToRetrieveManagedPassword`, not by an ACE.
 
 The Ownership stage backs this up: it checks that objects under the model root are *owned* by
 Domain Admins (RID 512), because an object's owner can always re-permission it regardless of the
@@ -214,7 +243,8 @@ registered and the machine version bumped — visible in GPMC like any hand-made
 | `...\NetworkProvider\HardenedPaths\\\\*\SYSVOL` and `\\*\NETLOGON` | `RequireMutualAuthentication=1, RequireIntegrity=1` | Policy and script retrieval require mutual auth and signing — blocks GPO-over-SMB spoofing. |
 | `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\RunAsPPL` | `1` | LSASS as a protected process — raises the bar for credential dumping. |
 
-Each GPO also gets an **exception group** (`DL-T<x>-Exempt-Logon` in the tier's `Groups` OU):
+Each GPO also gets an **exception group** (`DL-T<x>-Exempt-Logon`, like the deny groups in
+`Tier-0/Groups`, because membership switches the tier's restrictions off):
 an escape hatch for the one appliance account that legitimately crosses the line, visible and
 auditable instead of an undocumented GPO edit.
 
@@ -232,8 +262,11 @@ point, but if you rely on those groups, know it before you link.
   master. Requires the Windows LAPS module (Server 2022 / Win11 22H2+ host).
 - **Directory permissions**, per delegation entry: computers get self-write on their password
   attributes; `G-T<x>-Admins` get read and reset on their own tier's OU. The Domain Controllers
-  OU gets self/read/reset but **no policy GPO and no decryptor entry** — the DSRM password's
-  decryptor is always Domain Admins and cannot be redirected.
+  OU gets self/read/reset and its own policy, **`T0-DC-LAPS`**: on a DC, Windows LAPS manages
+  the **DSRM** password - rotated, backed up encrypted to `msLAPS-EncryptedDSRMPassword`, and
+  decryptable by Domain Admins only (the decryptor cannot be redirected, so no decryptor entry).
+  It needs domain functional level 2016; below that the policy is skipped and reported. Every
+  run checks each DC for a stored DSRM backup - the recovery path in §7 depends on it.
 - **Policy GPO** per tier (`T<x>-LAPS`), values under
   `HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\LAPS`:
 
@@ -264,12 +297,16 @@ Per configured silo (default: Tier 0 and Tier 1), one authentication policy and 
   source machine to be a silo member — with an `ED` (Enterprise Domain Controllers) escape so a
   DC promoted after the last sync does not orphan the accounts.
 - **`Tier-0-Silo`**: members are the role groups' users (`G-T0-Admins`, `G-T0-Operators`), all
-  computers under `Tier-0/Devices` and `Tier-0/Servers`, and the domain controllers. Membership
-  is (re-)synchronised on every Deploy and every Sync run.
+  computers under `Tier-0/Devices` and `Tier-0/Servers`, and the domain controllers - minus
+  accounts marked `excludeFromSilo` (the break-glass account). Membership is (re-)synchronised on
+  every Deploy and every Sync run, in both directions: objects assigned to the silo that no longer
+  qualify are listed (`authenticationPolicySiloReconcile: Report`) or removed (`Enforce`), and an
+  account that qualifies for two silos is reported as a conflict and assigned to neither.
 - **Enforcement default: `Audit`.** In audit mode the DCs log event 4820/4821 for every logon
   the silo *would* refuse, and refuse nothing. Flipping
   `options.authenticationPolicyEnforcement` to `Enforce` is the last step of the rollout, not
-  the first.
+  the first. The next Deploy or Sync switches existing policies and silos over - and withholds
+  that while the Kerberos armoring settings below are not configured and deployed.
 
 ### InstallTask — the daily converge
 
@@ -277,6 +314,23 @@ Registers `\ADTierKit\ADTierKit Membership Sync`: daily at 03:30, as SYSTEM, run
 `-Mode Sync` with explicit log and report directories, 2-hour execution limit. Before
 registering, the ACLs of the script, the configuration and both parent directories are checked;
 paths modifiable outside the administrative set are refused (override: `-SkipAclCheck`, see §6).
+
+Two hardening switches:
+
+- **`-RequireSignedScript`** - the task runs with `ExecutionPolicy AllSigned` instead of `Bypass`.
+  Registration refuses a script without a valid signature, and a signer that is not in
+  `LocalMachine\TrustedPublisher` (under SYSTEM nobody answers the untrusted-publisher prompt,
+  so every run would fail). Re-sign after every update of the script.
+- **`-PinConfiguration`** - the task carries the configuration's SHA256. A changed file stops the
+  run before anything is loaded: exit code `5`, Application event 1003. Register the task again
+  after every intended change.
+
+What Sync does each night besides nesting and silo assignment: **account hygiene** - every user
+in a role group of any tier gets *account is sensitive and cannot be delegated*, every top tier
+account (except `excludeFromSilo`) lands in Protected Users - and a report of **undeclared
+members** of LocalAdmins / RemoteDesktop groups (High when the member belongs to another tier)
+and of every member of an exception group. Nothing is removed from access groups
+automatically; that stays a decision.
 
 ### Files on disk
 
@@ -370,6 +424,20 @@ event just made visible). Clean log for a few weeks → flip
 `authenticationPolicyEnforcement` to `Enforce` → deploy → fresh-logon test from a PAW while a
 DC console session stays open. The break-glass account stays outside the silo throughout.
 
+**Phase 8 — Prove it on the machines.** `lab\Test-LogonMatrix.ps1` logs on locally with one
+test account per tier (interactive, network, batch, service) and compares every result with what
+the configuration says should happen - the directory checks cannot show what a server has
+actually applied. Run it on one machine per tier, a DC and a staged machine, after
+`gpupdate /force`:
+
+```powershell
+$accounts = @{ '0' = Get-Credential LAB\t0-probe; '1' = Get-Credential LAB\t1-probe; '2' = Get-Credential LAB\t2-probe }
+.\lab\Test-LogonMatrix.ps1 -MachineTier 1 -Account $accounts     # or -MachineTier DC / Staging
+```
+
+Test accounts only - each a member of its tier's admin role group, created from the template.
+RDP is not covered (no local equivalent); it is denied by the same group as interactive logon.
+
 Then `-Mode InstallTask`, and the model maintains its own membership from here.
 
 ---
@@ -398,9 +466,12 @@ from Protected Users.
 **Enforced silos have client-side prerequisites.** Authentication policies ride on Kerberos
 armoring (FAST): domain functional level 2012 R2+, *KDC support for claims, compound
 authentication and Kerberos armoring* enabled on the DCs, and the matching Kerberos client
-setting on the machines T0 admins authenticate from. **The tool does not deploy these two GPO
-settings.** Verify them during the audit phase — enforcement without them refuses logons for
-the wrong reason.
+setting on the machines T0 admins authenticate from. Both ship in the generated GPOs at level
+*Supported* (unarmoured requests keep working): KDC support in `T0-DomainController-Baseline`,
+client support in every tier GPO. The Silo stage checks that they are configured for the DCs and
+for every OU a silo draws computers from, and present in the deployed policy, and withholds
+enforcement otherwise. Whether every client has *processed* the policy is something only the
+4820/4821 audit phase can show.
 
 **User rights are tattooed.** Unlinking a GPO does not restore the rights it removed; the
 values persist until something writes new ones. This is why the fresh-logon test keeps a session
@@ -445,7 +516,7 @@ one), another machine over the network (network logon is not denied across tiers
 the built-in RID 500 Administrator at the console, and DSRM as the last resort.
 `Repair-TierLockout.ps1 -WhatIf` first, then without: it removes RID 500 from the tier role
 groups (that membership is what put it in a deny group), restores the DC logon-right defaults,
-and re-checks every deny group before it will re-enable anything. GPO links stay disabled unless
+and re-checks the deny groups of the GPOs that reach the DC before it will re-enable anything. GPO links stay disabled unless
 you pass `-EnableGpoLinks` and the check is clean.
 
 ---

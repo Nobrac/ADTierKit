@@ -18,6 +18,9 @@ $source = Get-Content -Raw $PSScriptRoot/../ADTierKit.ps1
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
 $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
 foreach ($f in $functions) { . ([scriptblock]::Create($f.Extent.Text)) }
+
+# Every directory command fails loudly unless a mock below replaces it - see TestIsolation.ps1.
+. (Join-Path $PSScriptRoot 'TestIsolation.ps1')
 Write-Host "Loaded $($functions.Count) functions`n"
 
 # Write-TierLog needs the module-scope log state; a stub keeps the output readable.
@@ -96,7 +99,8 @@ Assert-That 'gPLink ACE created for Tier 1' ($linkAce.Count -eq 1)
 Assert-That 'gPLink ACE is writable' ($linkAce[0].rights -eq 'ReadProperty, WriteProperty')
 $optionsAce = @($t1.delegations | Where-Object { $_.principal -eq 'G-T1-GPO-Admins' -and $_.objectType -eq 'gPOptions' })
 Assert-That 'gPOptions ACE is read only' ($optionsAce.Count -eq 1 -and $optionsAce[0].rights -eq 'ReadProperty')
-Assert-That 'no principal can write gPOptions' (@($config.tiers | ForEach-Object { $_.delegations } | Where-Object { $_.objectType -eq 'gPOptions' -and $_.rights -match 'WriteProperty' }).Count -eq 0)
+# Deny entries on gPOptions are the point, not a grant - only an allow counts here.
+Assert-That 'no principal can write gPOptions' (@($config.tiers | ForEach-Object { $_.delegations } | Where-Object { $_.objectType -eq 'gPOptions' -and $_.rights -match 'WriteProperty' -and $_.type -ne 'Deny' }).Count -eq 0)
 
 Assert-That 'tier 2 delegations were not contaminated by tier 1' (@($t2.delegations | Where-Object principal -eq 'G-T1-GPO-Admins').Count -eq 0)
 
