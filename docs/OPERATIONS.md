@@ -2,8 +2,8 @@
 
 This is the long-form manual: how the tool thinks, every change it makes to the directory and to
 the machines the policies reach, how to work with it day to day, and the mistakes that cost
-people a weekend. The [README](../README.md) is the reference; this is the walkthrough. If the
-two ever disagree, the README and the code win.
+people a weekend. The [Guide](GUIDE.md) is the reference; this is the walkthrough. If the
+two ever disagree, the Guide and the code win.
 
 ## Contents
 
@@ -87,8 +87,8 @@ features), the required modules, elevation, SYSVOL write access, and whether the
 is the forest root — `Enterprise Admins` and `Schema Admins` live there, and a child domain gets
 a reduced privileged-group watch list.
 
-**Decide what Tier 0 actually contains** before generating a configuration. The README section
-[What belongs in Tier 0](../README.md#what-belongs-in-tier-0) has the test and the usual
+**Decide what Tier 0 actually contains** before generating a configuration. The Guide section
+[What belongs in Tier 0](GUIDE.md#what-belongs-in-tier-0) has the test and the usual
 suspects — PKI, Entra Connect, backup, hypervisors hosting DCs, endpoint management that reaches
 DCs. The tool secures the boundary you declare; classification is the part it cannot do for you.
 
@@ -381,7 +381,7 @@ expectation is your upgrade review.
 
 ## 5. The rollout playbook
 
-The README's [rollout order](../README.md#recommended-rollout-order) is the map; this is the
+The Guide's [rollout order](GUIDE.md#recommended-rollout-order) is the map; this is the
 same route with the checks written out. The principle behind every step: **nothing that removes
 a logon right gets applied until the thing replacing it has been proven to work.**
 
@@ -391,7 +391,7 @@ exist and contain the foreign role groups, `Get-ADObject -Identity <domain> -Pro
 ms-DS-MachineAccountQuota` shows `0`, a test join lands in `Tier-2/Staging`.
 
 **Phase 2 — Populate.** Move machines into the tier OUs — staging first, production after the
-GPOs are proven. Move the Tier 0 list from the README's classification section (PKI, Entra
+GPOs are proven. Move the Tier 0 list from the Guide's classification section (PKI, Entra
 Connect, backup, hypervisors) into `Tier-0/Servers`, and the admin workstations into
 `Tier-0/Devices` — **the silo's audit phase can only prove the PAWs are in if they are actually
 in.** Create the per-tier admin accounts and populate the role groups.
@@ -446,7 +446,7 @@ Then `-Mode InstallTask`, and the model maintains its own membership from here.
 
 **Tier 0 classification is the whole game.** Perfectly enforced deny rights around a backup
 server that sits in Tier 1 protect nothing. Re-read
-[What belongs in Tier 0](../README.md#what-belongs-in-tier-0) once a year and whenever
+[What belongs in Tier 0](GUIDE.md#what-belongs-in-tier-0) once a year and whenever
 infrastructure changes — new hypervisor cluster, new backup product, new management tool with an
 agent on the DCs.
 
@@ -510,7 +510,7 @@ through.
 
 ## 7. When it goes wrong
 
-The short version — the README's [When it goes wrong](../README.md#when-it-goes-wrong) has the
+The short version — the Guide's [When it goes wrong](GUIDE.md#when-it-goes-wrong) has the
 full route list. Ways back in, in order: an already-open session (this is why the playbook keeps
 one), another machine over the network (network logon is not denied across tiers by default),
 the built-in RID 500 Administrator at the console, and DSRM as the last resort.

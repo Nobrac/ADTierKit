@@ -187,7 +187,7 @@ tool protects and checks itself, one removes report noise.
 
 First tagged release. Everything below has been deployed and exercised against a Windows Server
 2025 lab domain at functional level `Windows2025Domain`; see
-[Limitations & notes](README.md#limitations--notes) for what that did not cover.
+[Limitations & notes](docs/GUIDE.md#limitations--notes) for what that did not cover.
 
 ### Added
 
