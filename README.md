@@ -102,6 +102,18 @@ Upgrading an existing configuration: run `.\Update-TierConfiguration.ps1` first,
 
 ⚠️ only with `-Apply` · ✅ writes · — read-only. Exit codes and every option: see the [Guide](docs/GUIDE.md#modes).
 
+### Graphical front end
+
+```powershell
+.\ADTierKit-Gui.ps1
+```
+
+A WPF window over the same script: pick the configuration, a mode and the stages, and it shows
+the exact `ADTierKit.ps1` command line it will run, streams the output, and opens the report and
+log folder. An apply asks you to plan the same stages first and spells out what `-Force` and the
+GPO stage mean before anything is written. The wizard still runs in a console window, started
+from the GUI. Details: [Guide](docs/GUIDE.md#graphical-front-end).
+
 ## Documentation
 
 | | |

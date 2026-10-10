@@ -13,7 +13,7 @@ the rollout playbook - see the **[Operator's Guide](OPERATIONS.md)**. Back to th
 
 | Getting there | Understanding it | When you need it |
 |---|---|---|
-| [Modes](#modes) | [Roles](#roles) | [Troubleshooting](#troubleshooting) |
+| [Modes](#modes) · [GUI](#graphical-front-end) | [Roles](#roles) | [Troubleshooting](#troubleshooting) |
 | [What it deploys](#what-it-deploys) | [Ownership](#ownership) | [When it goes wrong](#when-it-goes-wrong) |
 | [Guardrails](#guardrails) | [Design decisions](#design-decisions-worth-knowing) | [Checking the code](#checking-the-code) |
 | [Prerequisites](#prerequisites) | [Configuration reference](#configuration-reference) | [Limitations & notes](#limitations--notes) |
@@ -37,6 +37,29 @@ the rollout playbook - see the **[Operator's Guide](OPERATIONS.md)**. Back to th
 ⚠️ needs `-Apply` before anything is written · ✅ writes to the directory · — read-only
 
 **Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` deploy failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` high severity findings &nbsp;·&nbsp; `5` pinned configuration changed
+
+### Graphical front end
+
+`.\ADTierKit-Gui.ps1` opens a window for the non-interactive modes. It adds no logic of its own:
+every run is `ADTierKit.ps1` started in Windows PowerShell 5.1 with the parameters shown in the
+command line box, so the log, the report, the exit code and the event log entries are the same as
+from a console, and the command can be copied into a runbook.
+
+- **Configuration** - choose the file, see its name, tiers and the options that change behaviour
+  (silo enforcement, restricted groups mode, privileged group mode), with warnings for the
+  settings that remove access. *Start wizard* opens the interactive wizard in its own console;
+  *Reload* reads the file again afterwards.
+- **Mode** - Check, Audit, Deploy, Sync or Install task. Deploy offers the stages, with the two
+  rollout windows as presets, and the `-Apply`, `-Force` and `-SkipPrerequisiteCheck` switches.
+- **Run** - output is streamed and coloured, the exit code is translated, *Stop* ends the run and
+  its child processes, *Open latest report* opens the newest HTML report.
+
+Safeguards: an apply that has not been planned with the same stages and the same configuration
+file contents in this window asks to plan first; every apply, sync and task registration shows
+the command and asks for confirmation, with an explicit warning for `-Force`, for
+`-SkipPrerequisiteCheck` and for the GPO stage (logon rights are tattooed). Run the window
+elevated, as for the console. It needs Windows; `-ScriptPath` points it at a copy of
+`ADTierKit.ps1` elsewhere.
 
 ---
 
@@ -805,6 +828,7 @@ swallowed exceptions, two of them inside the lockout guard itself, and
 README.md                     overview and quick start
 LICENSE                       MIT
 ADTierKit.ps1                 the entire tool
+ADTierKit-Gui.ps1             graphical front end - runs ADTierKit.ps1 with the parameters it shows
 Repair-TierLockout.ps1        recovery from a logon lockout
 config/tiermodel.json         your configuration — the source of truth
 config/roles.example.json     ready-made DNS and Group Policy roles to copy in

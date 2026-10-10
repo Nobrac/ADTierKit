@@ -197,6 +197,10 @@ $script:SchemaGuidCache = @{}
 # Resolved once per run: the schemaIDGUIDs of every msLAPS-* attribute.
 $script:LapsAttributeGuids = $null
 $script:PrincipalCache = @{}
+# Per run: names the configuration declares (groups, accounts, exception groups) and the verdict
+# on whether the directory object carrying each name may be adopted. See Test-TierAdoptableObject.
+$script:TierDeclaredNames = $null
+$script:TierAdoptionCache = @{}
 
 function Initialize-TierLog {
     [CmdletBinding()]
@@ -881,6 +885,9 @@ function Initialize-TierContext {
         $stagingDn = "OU=$stagingName,$rootDn"
     }
 
+    $script:TierDeclaredNames = $null
+    $script:TierAdoptionCache = @{}
+
     $script:TierContext = [pscustomobject]@{
         Domain           = $domain
         DomainDn         = $domain.DistinguishedName
@@ -902,7 +909,11 @@ function Initialize-TierContext {
         ForestDnsZonesDn    = "CN=MicrosoftDNS,DC=ForestDnsZones,$forestDn"
         PoliciesDn          = "CN=Policies,$systemDn"
         AdminSdHolderDn     = "CN=AdminSDHolder,$systemDn"
-        SysvolPolicyPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies"
+        # The domain controller the run targets, not the \\domain DFS namespace. New-GPO creates
+        # the policy folder on -Server; the namespace may resolve to another controller where the
+        # folder has not replicated yet, and the GptTmpl.inf and GPT.INI written there race the
+        # version number written to the directory on -Server.
+        SysvolPolicyPath = "\\$(if ($Server) { $Server } else { $domain.PDCEmulator })\SYSVOL\$($domain.DNSRoot)\Policies"
         Configuration    = $Configuration
         # Lets a bare tier name be resolved as an OU reference without a tier context.
         TierNames        = @($Configuration.tiers | ForEach-Object { $_.name })
@@ -1029,7 +1040,7 @@ function Resolve-TierPrincipal {
     $ad = Get-TierAdParameter
 
     try {
-        if ($Reference -match '^S-1-') {
+        if ($Reference -match '^S-1-[0-9-]+$') {
             # By LDAP filter, not -Identity: Get-ADObject binds -Identity to a distinguished name
             # or a GUID and rejects a SID outright, which surfaces as an unresolvable principal
             # several frames later rather than as an error anyone can act on.
@@ -1058,17 +1069,39 @@ function Resolve-TierPrincipal {
             return $resolved
         }
 
-        $obj = Get-ADObject -Filter "sAMAccountName -eq '$Reference'" -Properties objectSid, sAMAccountName @ad -ErrorAction Stop |
+        # Quotes doubled for the -Filter grammar, so a name from the configuration cannot end the
+        # string literal and widen the query.
+        $quoted = $Reference.Replace("'", "''")
+        $obj = Get-ADObject -Filter "sAMAccountName -eq '$quoted'" -Properties objectSid, sAMAccountName @ad -ErrorAction Stop |
             Select-Object -First 1
 
         if (-not $obj) {
-            $obj = Get-ADObject -Filter "name -eq '$Reference'" -Properties objectSid, sAMAccountName @ad -ErrorAction Stop |
-                Select-Object -First 1
+            # The fallback by name only accepts a security principal, and only an unambiguous one.
+            # A bare 'name' match used to take the first object of any class anywhere in the
+            # domain - a contact or a user a lower tier created with the right CN would then have
+            # received whatever the configuration grants to the group of that name.
+            $byName = @(Get-ADObject -Filter "name -eq '$quoted'" -Properties objectSid, sAMAccountName @ad -ErrorAction Stop |
+                    Where-Object { $_.objectSid })
+            if ($byName.Count -gt 1) {
+                throw "Principal '$Reference' is ambiguous - $($byName.Count) security principals carry that name. Reference it by sAMAccountName or SID."
+            }
+            $obj = $byName | Select-Object -First 1
         }
 
         if (-not $obj) {
             if ($AllowMissing) { return $null }
             throw "Principal '$Reference' was not found in $($ad.Server)."
+        }
+
+        # A name the configuration declares is one this tool creates. If the object carrying it
+        # was created by somebody else, it is not adopted: no membership, delegation, logon right
+        # or LAPS permission is granted to it. See Test-TierAdoptableObject.
+        if (Test-TierDeclaredName -Name $Reference) {
+            $refusal = Test-TierAdoptableObject -DistinguishedName $obj.DistinguishedName -Name $Reference
+            if ($refusal) {
+                if ($AllowMissing) { return $null }
+                throw $refusal
+            }
         }
 
         $resolved = [pscustomobject]@{
@@ -1084,6 +1117,109 @@ function Resolve-TierPrincipal {
         if ($AllowMissing) { return $null }
         throw
     }
+}
+
+function Test-TierDeclaredName {
+    <#
+        .SYNOPSIS
+        Says whether a name is one the configuration declares as an object this tool creates.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyString()][AllowNull()][string]$Name)
+
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+    if ($null -eq $script:TierDeclaredNames) {
+        $names = @{}
+        $ctx = $script:TierContext
+        if ($ctx -and $ctx.PSObject.Properties.Name -contains 'Configuration' -and $ctx.Configuration) {
+            foreach ($tier in @($ctx.Configuration.tiers)) {
+                foreach ($group in @($tier.groups | Where-Object { $_ -and $_.name })) { $names[[string]$group.name] = $true }
+                foreach ($account in @($tier.adminAccounts | Where-Object { $_ -and $_.samAccountName })) { $names[[string]$account.samAccountName] = $true }
+                foreach ($gpo in @($tier.gpos | Where-Object { $_ -and $_.exceptionGroup })) { $names[[string]$gpo.exceptionGroup] = $true }
+            }
+        }
+        $script:TierDeclaredNames = $names
+    }
+    return $script:TierDeclaredNames.ContainsKey($Name)
+}
+
+function Test-TierAdoptableObject {
+    <#
+        .SYNOPSIS
+        Refuses to adopt a pre-existing object that somebody outside the administrative set created.
+
+        .DESCRIPTION
+        Every object is found by name, and creation is idempotent by name: when a group or account
+        with a configured name already exists, it is used as it is. The names are predictable -
+        the shipped patterns produce G-T0-Admins, adm-t0-template and so on - so a lower tier
+        administrator who may create objects in their own branch can create one of them first.
+        Deployment would then move that group into the top tier, nest it into Domain Admins, grant
+        it the top tier delegations, or add the squatted account to the top tier role group. The
+        creator stays the owner, and an owner holds WRITE_DAC: the object stays theirs.
+
+        An object owned by Domain Admins (what the deployment account produces), Enterprise Admins,
+        Administrators or SYSTEM, or by an owner the ownership block accepts, is adopted. Anything
+        else is refused with a High finding until an administrator has looked at it and reassigned
+        the owner.
+
+        .OUTPUTS
+        $null when the object may be adopted, otherwise the reason it is refused.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DistinguishedName,
+        [string]$Name
+    )
+
+    $key = $DistinguishedName.ToLowerInvariant()
+    if ($script:TierAdoptionCache.ContainsKey($key)) { return $script:TierAdoptionCache[$key] }
+
+    $ad = Get-TierAdParameter
+    $owner = $null
+    try {
+        $object = Get-ADObject -Identity $DistinguishedName -Properties nTSecurityDescriptor @ad -ErrorAction Stop
+        if ($object -and $object.PSObject.Properties.Name -contains 'nTSecurityDescriptor' -and $object.nTSecurityDescriptor) {
+            $owner = $object.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier])
+        }
+    }
+    catch {
+        Write-TierLog -Message "Owner of $DistinguishedName could not be read - adoption not verified: $($_.Exception.Message)" -Level Warning
+    }
+
+    $verdict = $null
+    if ($owner) {
+        $ownerSid = [string]$owner.Value
+        $trusted = ($ownerSid -in @('S-1-5-18', 'S-1-5-32-544')) -or ($ownerSid -match '^S-1-5-21-\d+-\d+-\d+-(512|519)$')
+
+        if (-not $trusted) {
+            $ctx = $script:TierContext
+            $ownership = $null
+            if ($ctx -and $ctx.PSObject.Properties.Name -contains 'Configuration' -and $ctx.Configuration -and
+                $ctx.Configuration.PSObject.Properties.Name -contains 'ownership') { $ownership = $ctx.Configuration.ownership }
+            if ($ownership) {
+                foreach ($reference in @(@($ownership.owner) + @($ownership.acceptableOwners) | Where-Object { $_ })) {
+                    # Only RIDs and SIDs here: a name would resolve through Resolve-TierPrincipal,
+                    # which calls back into this function.
+                    $sid = if ("$reference" -match '^\d+$') { "$($ctx.DomainSid)-$reference" } elseif ("$reference" -match '^S-1-') { "$reference" } else { $null }
+                    if ($sid -and $sid -eq $ownerSid) { $trusted = $true; break }
+                }
+            }
+        }
+
+        if (-not $trusted) {
+            $ownerName = $ownerSid
+            try { $ownerName = $owner.Translate([System.Security.Principal.NTAccount]).Value } catch { $ownerName = $ownerSid }
+            $label = if ($Name) { $Name } else { $DistinguishedName }
+            $verdict = "'$label' already exists at $DistinguishedName and is owned by $ownerName, not by the administrative set. " +
+                'It was not created by this tool and is not adopted - no membership, delegation or right is granted to it. ' +
+                'Verify who created it; delete it, or reassign its owner to Domain Admins, then run again.'
+            Write-TierLog -Message $verdict -Level Error
+            Add-TierAction -Phase 'Adoption' -ObjectType 'ForeignObject' -Target $label -Result 'Failed' -Detail $verdict -Severity 'High'
+        }
+    }
+
+    $script:TierAdoptionCache[$key] = $verdict
+    return $verdict
 }
 
 function New-TierSecurityIdentifier {
@@ -1165,7 +1301,7 @@ function Get-TierSchemaGuid {
     $ad = Get-TierAdParameter
     $rootDse = Get-ADRootDSE @ad
 
-    $entry = Get-ADObject -SearchBase $rootDse.schemaNamingContext -LDAPFilter "(lDAPDisplayName=$Name)" -Properties schemaIDGUID @ad -ErrorAction SilentlyContinue |
+    $entry = Get-ADObject -SearchBase $rootDse.schemaNamingContext -LDAPFilter "(lDAPDisplayName=$(ConvertTo-TierLdapFilterValue -Value $Name))" -Properties schemaIDGUID @ad -ErrorAction SilentlyContinue |
         Select-Object -First 1
 
     if ($entry) {
@@ -1271,7 +1407,7 @@ function Get-TierPrivilegedGroupReference {
     }
 
     $ad = Get-TierAdParameter
-    return (Get-ADGroup -LDAPFilter "(sAMAccountName=$($Entry.name))" -Properties $Properties @ad -ErrorAction SilentlyContinue |
+    return (Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $Entry.name))" -Properties $Properties @ad -ErrorAction SilentlyContinue |
         Select-Object -First 1)
 }
 
@@ -2632,7 +2768,7 @@ function New-TierModelConfiguration {
         $clientArmoring = [ordered]@{ key = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'; valueName = 'EnableCbacAndArmor'; type = 'DWord'; value = 1; comment = 'Kerberos client support for claims, compound authentication and armoring - required by authentication policy silos' }
         $registrySettings += $clientArmoring
         if ($meta.IsTop) {
-            $registrySettings += [ordered]@{ key = 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'; valueName = 'RunAsPPL'; type = 'DWord'; value = 1; comment = 'Run LSA as a protected process' }
+            $registrySettings += [ordered]@{ key = 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'; valueName = 'RunAsPPL'; type = 'DWord'; value = 1; comment = 'Run LSA as a protected process. Value 1 sets the UEFI lock: removing the GPO does not turn it off again, the LSA Protected Process Opt-out tool does. Use 2 (no UEFI lock, Windows 11 22H2 / Server 2025 and later) where reversibility matters more.' }
         }
 
         $gpos = @(
@@ -3145,10 +3281,12 @@ function New-TierGroupSet {
     foreach ($tier in $Configuration.tiers) {
         foreach ($group in @($tier.groups)) {
             $path = Resolve-TierOuDn -Reference $group.targetOu -TierName $tier.name
-            $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$($group.name))" @ad -ErrorAction SilentlyContinue |
+            $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $group.name))" @ad -ErrorAction SilentlyContinue |
                 Select-Object -First 1
 
             if ($existing) {
+                # A group somebody else created under a configured name is never moved into place.
+                if (Test-TierAdoptableObject -DistinguishedName $existing.DistinguishedName -Name $group.name) { continue }
                 try {
                     $placement = Move-TierObjectToOu -DistinguishedName $existing.DistinguishedName -TargetOuDn $path -AuditOnly:$AuditOnly -Confirm:$false
                 }
@@ -3224,7 +3362,7 @@ function Set-TierGroupNesting {
             $members = @($group.members) | Where-Object { $_ }
             if (-not $members) { continue }
 
-            $container = Get-ADGroup -LDAPFilter "(sAMAccountName=$($group.name))" -Properties member @ad -ErrorAction SilentlyContinue |
+            $container = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $group.name))" -Properties member @ad -ErrorAction SilentlyContinue |
                 Select-Object -First 1
             if (-not $container) {
                 if ($WhatIfPreference) {
@@ -3506,7 +3644,7 @@ function Test-TierAccessGroupMembership {
         foreach ($group in @($tier.groups | Where-Object { $_ -and $_.scope -eq 'DomainLocal' })) {
             if ($skip.ContainsKey($group.name) -or $exceptionGroups.ContainsKey($group.name)) { continue }
 
-            $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$($group.name))" -Properties member @ad -ErrorAction SilentlyContinue | Select-Object -First 1
+            $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $group.name))" -Properties member @ad -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $live) { continue }
             $checked++
 
@@ -3538,7 +3676,7 @@ function Test-TierAccessGroupMembership {
 
     # --- exception groups --------------------------------------------------------------------------
     foreach ($name in $exceptionGroups.Keys) {
-        $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$name)" -Properties member @ad -ErrorAction SilentlyContinue | Select-Object -First 1
+        $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $name))" -Properties member @ad -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $live) { continue }
         $checked++
         foreach ($memberDn in @($live.member | Where-Object { $_ })) {
@@ -3601,7 +3739,7 @@ function Set-TierAdminAccountHygiene {
     $accounts = @{}
     foreach ($tier in @($Configuration.tiers)) {
         foreach ($group in @($tier.groups | Where-Object { $_ -and $_.scope -eq 'Global' })) {
-            $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$($group.name))" @ad -ErrorAction SilentlyContinue | Select-Object -First 1
+            $live = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $group.name))" @ad -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $live) { continue }
             foreach ($member in @(Get-ADGroupMember -Identity $live.DistinguishedName -Recursive @ad -ErrorAction SilentlyContinue | Where-Object { $_.objectClass -eq 'user' })) {
                 $key = $member.distinguishedName.ToLowerInvariant()
@@ -3696,10 +3834,13 @@ function New-TierAdminAccountSet {
     foreach ($tier in $Configuration.tiers) {
         foreach ($account in @($tier.adminAccounts)) {
             $path = Resolve-TierOuDn -Reference $account.targetOu -TierName $tier.name
-            $existing = Get-ADUser -LDAPFilter "(sAMAccountName=$($account.samAccountName))" @ad -ErrorAction SilentlyContinue |
+            $existing = Get-ADUser -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $account.samAccountName))" @ad -ErrorAction SilentlyContinue |
                 Select-Object -First 1
 
             if ($existing) {
+                # An account somebody else created under a configured name is never added to the
+                # tier's role groups - that would hand the creator the tier.
+                if (Test-TierAdoptableObject -DistinguishedName $existing.DistinguishedName -Name $account.samAccountName) { continue }
                 Write-TierLog -Message "Account exists: $($account.samAccountName)" -Level Skip
                 Add-TierAction -Phase 'Account' -ObjectType 'User' -Target $account.samAccountName -Result 'Compliant'
             }
@@ -3742,9 +3883,9 @@ function New-TierAdminAccountSet {
 
             foreach ($groupName in @($account.memberOf)) {
                 try {
-                    $group = Get-ADGroup -LDAPFilter "(sAMAccountName=$groupName)" -Properties member @ad -ErrorAction Stop | Select-Object -First 1
+                    $group = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $groupName))" -Properties member @ad -ErrorAction Stop | Select-Object -First 1
                     if (-not $group) { continue }
-                    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$($account.samAccountName))" @ad | Select-Object -First 1
+                    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $account.samAccountName))" @ad | Select-Object -First 1
                     if (-not $user) { continue }
                     if ($group.member -contains $user.DistinguishedName) { continue }
                     if ($AuditOnly) {
@@ -4180,6 +4321,14 @@ function Set-TierPrivilegedGroupMembership {
     try {
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
         $protectedSids.Add($me.User.Value)
+        # The groups the operator holds their rights through are protected as well. Guarding the
+        # account alone still let an enforce run remove the nested group that makes the operator
+        # a Domain Admin - the account stayed, its privileges did not.
+        foreach ($groupSid in @($me.Groups | ForEach-Object { $_.Value })) {
+            # Domain Users, Guests and Computers are never a reason to keep a member: nested into
+            # a privileged group they are the drift this stage exists to remove.
+            if ($groupSid -match '^S-1-5-21-' -and $groupSid -notmatch '-(513|514|515)$') { $protectedSids.Add($groupSid) }
+        }
     }
     catch {
         # Losing this means the guard that keeps the operator in the group is gone. Enforcing
@@ -4275,8 +4424,11 @@ function Set-TierPrivilegedGroupMembership {
             Add-TierAction -Phase 'PrivilegedGroups' -ObjectType 'GroupMember' -Target "$label : $($keep.name)" -Result 'Compliant' -Detail 'Protected identity, never removed'
         }
 
-        # Guard: Domain Admins must never end up empty.
-        if ($entry.sid -eq '512') {
+        # Guard: Domain Admins, Enterprise Admins and Administrators must never end up empty.
+        # Decided on the group's real SID: the configuration may address it as '512' or as the
+        # full S-1-5-21-...-512, and the old check only recognised the short form.
+        $groupSidValue = if ($group.PSObject.Properties.Name -contains 'SID' -and $group.SID) { [string]$group.SID.Value } else { [string]$entry.sid }
+        if ($groupSidValue -match '-(512|519)$' -or $groupSidValue -eq 'S-1-5-32-544' -or $entry.sid -in @('512', '519', 'S-1-5-32-544')) {
             $remaining = $current.Count - $removable.Count + $absent.Count
             if ($remaining -lt 1) {
                 Write-TierLog -Message "Enforcing $label would leave it without members - skipped. Add a declared member first." -Level Error
@@ -4621,7 +4773,15 @@ function Test-TierLogonLockout {
                 $group = Resolve-TierPrincipal -Reference $groupName -AllowMissing
                 if (-not $group -or -not $group.DistinguishedName) { continue }
 
-                foreach ($member in @(Get-ADGroupMember -Identity $group.DistinguishedName -Recursive @ad -ErrorAction SilentlyContinue)) {
+                # A membership that cannot be read is not a membership that is safe. It used to be
+                # read with SilentlyContinue, so a failed read reported 'no lockout risk'.
+                $denyMembers = @()
+                try { $denyMembers = @(Get-ADGroupMember -Identity $group.DistinguishedName -Recursive @ad -ErrorAction Stop) }
+                catch {
+                    $problems.Add("$($gpo.name) denies logon to $groupName on $targetDn, whose membership could not be read ($($_.Exception.Message)) - the lockout risk is unverified")
+                    continue
+                }
+                foreach ($member in $denyMembers) {
                     if ($critical.ContainsKey($member.SID.Value)) {
                         $problems.Add("$($gpo.name) denies logon to $groupName on $targetDn, which contains $($critical[$member.SID.Value])")
                     }
@@ -4781,7 +4941,7 @@ function New-TierGpoSet {
             # unlinking the GPO or moving the machine out of its tier.
             if ($gpoDef.exceptionGroup) {
                 $exceptionOu = Resolve-TierOuDn -Reference $gpoDef.exceptionGroupOu -TierName $tier.name
-                $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$($gpoDef.exceptionGroup))" @adParams -ErrorAction SilentlyContinue | Select-Object -First 1
+                $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $gpoDef.exceptionGroup))" @adParams -ErrorAction SilentlyContinue | Select-Object -First 1
 
                 if (-not $existing -and -not $AuditOnly) {
                     if ($PSCmdlet.ShouldProcess($gpoDef.exceptionGroup, "Create GPO exception group in $exceptionOu")) {
@@ -4792,7 +4952,7 @@ function New-TierGpoSet {
                             Write-TierLog -Message "Exception group created: $($gpoDef.exceptionGroup)" -Level Success
                             Add-TierAction -Phase 'GPO' -ObjectType 'ExceptionGroup' -Target $gpoDef.exceptionGroup -Result 'Created' -Detail $exceptionOu
                             Clear-TierPrincipalCache
-                            $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$($gpoDef.exceptionGroup))" @adParams -ErrorAction SilentlyContinue | Select-Object -First 1
+                            $existing = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $gpoDef.exceptionGroup))" @adParams -ErrorAction SilentlyContinue | Select-Object -First 1
                         }
                         catch {
                             Write-TierLog -Message "Exception group $($gpoDef.exceptionGroup) failed - $($_.Exception.Message)" -Level Error
@@ -4802,6 +4962,10 @@ function New-TierGpoSet {
                 }
                 elseif (-not $existing) {
                     Add-TierAction -Phase 'GPO' -ObjectType 'ExceptionGroup' -Target $gpoDef.exceptionGroup -Result 'Missing'
+                }
+                elseif (Test-TierAdoptableObject -DistinguishedName $existing.DistinguishedName -Name $gpoDef.exceptionGroup) {
+                    # Somebody else's group: no move, and no deny ACE that would make it an exemption.
+                    $existing = $null
                 }
                 else {
                     # Same reasoning as the deny logon group: membership exempts machines from the
@@ -5605,7 +5769,7 @@ function Get-TierSiloCandidate {
     $seen = @{}
 
     foreach ($groupName in @($SiloDefinition.memberGroups)) {
-        $group = Get-ADGroup -LDAPFilter "(sAMAccountName=$groupName)" @ad -ErrorAction SilentlyContinue | Select-Object -First 1
+        $group = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-TierLdapFilterValue -Value $groupName))" @ad -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $group) { continue }
         Get-ADGroupMember -Identity $group.DistinguishedName -Recursive @ad -ErrorAction SilentlyContinue |
             Where-Object { $_.objectClass -eq 'user' } |
@@ -5761,7 +5925,7 @@ function ConvertTo-TierLdapFilterValue {
         Escapes a value for use inside an LDAP filter (RFC 4515).
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Value)
     return ($Value -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29' -replace "`0", '\00')
 }
 
@@ -6335,7 +6499,13 @@ function Get-TierUntrustedPathWriter {
         still reported - a false positive in the safe direction.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string[]]$Path)
+    param(
+        [Parameter(Mandatory)][string[]]$Path,
+        # For directories further up the tree: only what lets somebody swap the directory below
+        # (delete or rename a child, rewrite the DACL, take ownership) counts. Creating files in
+        # C:\ is something every user may do, and is not a way to change what the task runs.
+        [switch]$Ancestor
+    )
 
     $trustedSids = @(
         'S-1-5-18',                                                          # SYSTEM
@@ -6352,6 +6522,12 @@ function Get-TierUntrustedPathWriter {
         [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
         [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
         [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+    if ($Ancestor) {
+        $writeMask = [System.Security.AccessControl.FileSystemRights](
+            [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+    }
 
     $isTrusted = {
         param([System.Security.Principal.SecurityIdentifier]$Sid)
@@ -6433,7 +6609,21 @@ function Install-TierModelScheduledTask {
             $scriptFull, $configFull,
             (Split-Path $scriptFull -Parent), (Split-Path $configFull -Parent)
         )
-        $writers = Get-TierUntrustedPathWriter -Path $checkedPaths
+        $writers = @(Get-TierUntrustedPathWriter -Path $checkedPaths)
+
+        # A writable grandparent is as good as a writable parent: whoever may delete or rename a
+        # child there can move the ADTierKit folder aside and put their own in its place.
+        $ancestors = [System.Collections.Generic.List[string]]::new()
+        foreach ($start in @((Split-Path $scriptFull -Parent), (Split-Path $configFull -Parent))) {
+            $current = Split-Path $start -Parent
+            while ($current) {
+                if ($ancestors -notcontains $current -and $checkedPaths -notcontains $current) { $ancestors.Add($current) }
+                $next = Split-Path $current -Parent
+                if (-not $next -or $next -eq $current) { break }
+                $current = $next
+            }
+        }
+        if ($ancestors.Count -gt 0) { $writers += @(Get-TierUntrustedPathWriter -Path $ancestors.ToArray() -Ancestor) }
 
         if ($writers.Count -gt 0) {
             foreach ($writer in $writers) {
@@ -6669,7 +6859,22 @@ function Test-TierModelIsolation {
             Add-TierAction -Phase 'Isolation' -ObjectType 'PrivilegedGroup' -Target $label -Result 'Failed' -Detail $_.Exception.Message
             continue
         }
-        $outside = @($members | Where-Object { $_.distinguishedName -notlike "*$tier0Dn" -and $_.distinguishedName -notlike "*CN=Users,$($ctx.DomainDn)" })
+        # Built-in principals (RID below 1000: Administrator, Domain Admins, Enterprise Admins and
+        # the like) are expected here wherever they sit. Everything else has to live in the top
+        # tier. The previous rule accepted anything in CN=Users, which is exactly where an account
+        # nobody classified ends up - a helpdesk user added to Domain Admins passed the check.
+        $isBuiltIn = {
+            param($member)
+            $sidValue = if ($member.SID) { [string]$member.SID.Value } else { '' }
+            if (-not $sidValue -and $member.SID) { $sidValue = [string]$member.SID }
+            if ($sidValue -match '^S-1-5-32-') { return $true }
+            if ($sidValue -match '-(\d+)$' -and [int64]$Matches[1] -lt 1000) { return $true }
+            return $false
+        }
+        $outside = @($members | Where-Object {
+                $dn = [string]$_.distinguishedName
+                -not ($dn -ieq $tier0Dn -or $dn -like "*,$tier0Dn") -and -not (& $isBuiltIn $_)
+            })
 
         if ($members.Count -eq 0) {
             Add-TierAction -Phase 'Isolation' -ObjectType 'PrivilegedGroup' -Target $label -Result 'Compliant' -Detail 'Empty'
@@ -6813,10 +7018,22 @@ function Get-TierAceRisk {
         '5b47d60f-6090-40b2-9f37-2a4de88f3063' = 'msDS-KeyCredentialLink'
         '3f78c3e5-f79a-46bd-a0b8-9d18116ddc79' = 'msDS-AllowedToActOnBehalfOfOtherIdentity'
         'f3a64788-5306-11d1-a9c5-0000f80367c1' = 'servicePrincipalName'
+        # Who may retrieve a gMSA password - writing it is reading the password.
+        '888eedd6-ce04-df40-b462-b8a50e41ba38' = 'msDS-GroupMSAMembership'
+        # The User-Account-Restrictions property set. It contains
+        # msDS-AllowedToActOnBehalfOfOtherIdentity and userAccountControl, so a write to it is
+        # resource based constrained delegation (BloodHound: WriteAccountRestrictions).
+        '4c164200-20c0-11d0-a768-00aa006e0529' = 'Account Restrictions (RBCD, userAccountControl)'
     }
     $controlRights = @{
         '00299570-246d-11d0-a768-00aa006e0529' = 'Reset Password'
         '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'Replicating Directory Changes All (DCSync)'
+        '89e95b76-444d-4c62-991a-0facbeda640c' = 'Replicating Directory Changes In Filtered Set (DCSync)'
+    }
+    # Validated writes that are an attack path on their own.
+    $validatedWrites = @{
+        # Self-Membership: the principal may add itself to the group (BloodHound: AddSelf).
+        'bf9679c0-0de6-11d0-a285-00aa003049e2' = 'Self-Membership (add itself to the group)'
     }
 
     if (($Rights -band $genericAll) -eq $genericAll) { return 'GenericAll' }
@@ -6831,7 +7048,10 @@ function Get-TierAceRisk {
         if ($unscoped) { return 'All extended rights' }
         if ($controlRights.ContainsKey("$type")) { return $controlRights["$type"] }
     }
-    if (($Rights -band $self) -ne 0 -and $unscoped) { return 'All validated writes' }
+    if (($Rights -band $self) -ne 0) {
+        if ($unscoped) { return 'All validated writes' }
+        if ($validatedWrites.ContainsKey("$type")) { return $validatedWrites["$type"] }
+    }
     return $null
 }
 
@@ -6860,7 +7080,17 @@ function Get-TierTrustedSid {
     foreach ($rid in '512', '516', '520', '526') { $trusted["$($ctx.DomainSid)-$rid"] = $true }
 
     $top = @($Configuration.tiers)[0]
-    foreach ($group in @($top.groups | Where-Object { $_ })) {
+
+    # The staging join group is declared on the top tier only because its group OU is there. It is
+    # a low privilege group - whoever joins machines - and trusting it like a Tier 0 group hid every
+    # ACE it holds on top tier objects from the checks below.
+    $untrustedNames = @{}
+    if ($Configuration.PSObject.Properties.Name -contains 'staging' -and $Configuration.staging) {
+        $joinName = if ($Configuration.staging.PSObject.Properties.Name -contains 'joinGroup' -and $Configuration.staging.joinGroup) { $Configuration.staging.joinGroup } else { 'DL-Staging-Join' }
+        $untrustedNames[[string]$joinName] = $true
+    }
+
+    foreach ($group in @($top.groups | Where-Object { $_ -and -not $untrustedNames.ContainsKey([string]$_.name) })) {
         $principal = Resolve-TierPrincipal -Reference $group.name -AllowMissing
         if ($principal -and $principal.SID) { $trusted[[string]$principal.SID] = $true }
     }
@@ -7956,7 +8186,7 @@ function Start-TierModelWizard {
         'simulate everything with -WhatIf and write a report, no changes',
         'create OUs, groups, nesting, accounts and delegation only - no GPOs, no silo',
         'run every stage including GPOs and the silo',
-        'exit and deploy later with Deploy-TierModel.ps1'
+        'exit and deploy later with ADTierKit.ps1 -Mode Deploy'
     ) -Default 'DryRun'
 
     switch ($action) {
@@ -7965,17 +8195,21 @@ function Start-TierModelWizard {
         }
         'Structure' {
             if (Read-TierBoolean -Question 'This will modify Active Directory. Continue?' -Example 'yes' -Default $false) {
-                Invoke-TierModelDeployment -ConfigurationPath $path -Stage OU, Group, Nesting, Account, Delegation -Force -Confirm:$false | Out-Null
+                # No -Force: it would also switch off the prerequisite check, and the confirmation
+                # above is the only question -Force was meant to skip.
+                Invoke-TierModelDeployment -ConfigurationPath $path -Stage OU, Group, Nesting, Account, Delegation -Confirm:$false | Out-Null
             }
         }
         'Full' {
             if (Read-TierBoolean -Question 'This will modify Active Directory including Group Policy. Continue?' -Example 'yes' -Default $false) {
-                Invoke-TierModelDeployment -ConfigurationPath $path -Force -Confirm:$false | Out-Null
+                # No -Force: it overrides the logon lockout guard and the Kerberos armoring
+                # prerequisite of silo enforcement - the two guards a first deployment needs most.
+                Invoke-TierModelDeployment -ConfigurationPath $path -Confirm:$false | Out-Null
             }
         }
         default {
             Write-Host ''
-            Write-Host "  Run .\Deploy-TierModel.ps1 -ConfigurationPath `"$path`" -WhatIf when you are ready." -ForegroundColor Gray
+            Write-Host "  Run .\ADTierKit.ps1 -Mode Deploy -ConfigurationPath `"$path`" to plan the deployment when you are ready." -ForegroundColor Gray
         }
     }
 }
@@ -8046,14 +8280,22 @@ function Show-TierModelPreview {
 
     if ($Configuration.options.createAuthenticationPolicySilo) {
         Write-Host ''
-        Write-Host '  Authentication policy silo' -ForegroundColor White
-        Write-Host ("    {0} / {1} - mode: {2}" -f $Configuration.authenticationPolicySilo.name, $Configuration.authenticationPolicySilo.policyName, $Configuration.options.authenticationPolicyEnforcement) -ForegroundColor DarkGray
+        Write-Host '  Authentication policy silos' -ForegroundColor White
+        # The generator writes authenticationPolicySilos (one per tier); the singular form is the
+        # pre-1.1 layout and is still read by the silo stage.
+        $previewSilos = @($Configuration.authenticationPolicySilos | Where-Object { $_ })
+        if (-not $previewSilos -and $Configuration.authenticationPolicySilo) { $previewSilos = @($Configuration.authenticationPolicySilo) }
+        foreach ($silo in $previewSilos) {
+            Write-Host ("    {0} / {1} - mode: {2}" -f $silo.name, $silo.policyName, $Configuration.options.authenticationPolicyEnforcement) -ForegroundColor DarkGray
+        }
     }
 
     Write-Host ''
     Write-Host '  Cross tier isolation' -ForegroundColor White
     foreach ($tier in $Configuration.tiers) {
-        $deny = @($tier.groups)[-1]
+        # By name, not position: the last group of a tier is not necessarily its deny group.
+        $denyName = Get-TierDenyLogonGroupName -Tier $tier
+        $deny = @($tier.groups | Where-Object { $_ -and $_.name -eq $denyName }) | Select-Object -First 1
         if ($deny -and $deny.members) {
             Write-Host ("    {0,-34} blocks {1}" -f $deny.name, ($deny.members -join ', ')) -ForegroundColor DarkGray
         }
