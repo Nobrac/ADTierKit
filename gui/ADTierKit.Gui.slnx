@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ADTierKit.Gui.Core/ADTierKit.Gui.Core.csproj" />
+    <Project Path="src/ADTierKit.Gui/ADTierKit.Gui.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ADTierKit.Gui.Core.Tests/ADTierKit.Gui.Core.Tests.csproj" />
+  </Folder>
+</Solution>

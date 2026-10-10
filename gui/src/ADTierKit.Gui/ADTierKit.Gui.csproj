@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>ADTierKit.Gui</RootNamespace>
+    <AssemblyName>ADTierKit.Gui</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- dotnet publish -c Release -r win-x64 gives one ADTierKit.Gui.exe that needs the
+         .NET 10 Desktop Runtime; add -p:SelfContained=true for a copy that needs nothing. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ADTierKit.Gui.Core\ADTierKit.Gui.Core.csproj" />
+  </ItemGroup>
+
+</Project>

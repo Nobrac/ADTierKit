@@ -40,26 +40,33 @@ the rollout playbook - see the **[Operator's Guide](OPERATIONS.md)**. Back to th
 
 ### Graphical front end
 
-`.\ADTierKit-Gui.ps1` opens a window for the non-interactive modes. It adds no logic of its own:
-every run is `ADTierKit.ps1` started in Windows PowerShell 5.1 with the parameters shown in the
-command line box, so the log, the report, the exit code and the event log entries are the same as
-from a console, and the command can be copied into a runbook.
+`ADTierKit.Gui.exe` (source in `gui/`, C# and WPF on .NET 10) is a window for the
+non-interactive modes. It adds no logic of its own: every run is `ADTierKit.ps1` started in
+Windows PowerShell 5.1 with the parameters shown in the command line box, so the log, the report,
+the exit code and the event log entries are the same as from a console, and the command can be
+copied into a runbook.
 
-- **Configuration** - choose the file, see its name, tiers and the options that change behaviour
-  (silo enforcement, restricted groups mode, privileged group mode), with warnings for the
-  settings that remove access. *Start wizard* opens the interactive wizard in its own console;
-  *Reload* reads the file again afterwards.
+- **Configuration** - choose the script and the configuration file, see the configuration's name,
+  tiers and the options that change behaviour, with warnings for the settings that remove access
+  (`Replace`, `Enforce`, enforced silos). *Start wizard* opens the interactive wizard in its own
+  console; *Reload* reads the file again afterwards.
 - **Mode** - Check, Audit, Deploy, Sync or Install task. Deploy offers the stages, with the two
   rollout windows as presets, and the `-Apply`, `-Force` and `-SkipPrerequisiteCheck` switches.
-- **Run** - output is streamed and coloured, the exit code is translated, *Stop* ends the run and
-  its child processes, *Open latest report* opens the newest HTML report.
+  The run button turns red when the next press writes.
+- **Run** - output is streamed and coloured like the console, the exit code is translated,
+  *Stop* ends the run and every process it started, *Open latest report* opens the newest HTML
+  report.
 
-Safeguards: an apply that has not been planned with the same stages and the same configuration
-file contents in this window asks to plan first; every apply, sync and task registration shows
-the command and asks for confirmation, with an explicit warning for `-Force`, for
-`-SkipPrerequisiteCheck` and for the GPO stage (logon rights are tattooed). Run the window
-elevated, as for the console. It needs Windows; `-ScriptPath` points it at a copy of
-`ADTierKit.ps1` elsewhere.
+Safeguards: an apply that has not been planned with the same stages, the same target and the same
+configuration file contents in this window asks to plan first; every apply, sync and task
+registration shows the command and asks for confirmation, with explicit warnings for `-Force`,
+`-SkipPrerequisiteCheck`, the GPO stage (logon rights are tattooed), the Recycle Bin and the
+privileged groups stage. The window starts unelevated and offers *Restart elevated*; it remembers
+paths and the target DC in `%APPDATA%\ADTierKit\gui.json`, never a mode or a switch.
+
+Build it with `dotnet publish gui\src\ADTierKit.Gui -c Release -r win-x64 -o <folder>`; it
+needs the .NET 10 Desktop Runtime (add `-p:SelfContained=true` for a copy that does not). It finds
+`ADTierKit.ps1` next to itself or up to four folders above.
 
 ---
 
@@ -777,6 +784,7 @@ in a third session. If it fails, recovery is a two-minute job instead of an even
 Install-Module PSScriptAnalyzer -Scope CurrentUser
 Invoke-ScriptAnalyzer -Path .\ADTierKit.ps1 -Severity Error
 .\tests\Invoke-AllTests.ps1
+dotnet test gui\ADTierKit.Gui.slnx          # the GUI's unit tests
 ```
 
 The same runs on every push and pull request in GitHub Actions (`.github/workflows/ci.yml`):
@@ -828,7 +836,7 @@ swallowed exceptions, two of them inside the lockout guard itself, and
 README.md                     overview and quick start
 LICENSE                       MIT
 ADTierKit.ps1                 the entire tool
-ADTierKit-Gui.ps1             graphical front end - runs ADTierKit.ps1 with the parameters it shows
+gui/                          graphical front end (C#, WPF, .NET 10) - runs ADTierKit.ps1 with the parameters it shows
 Repair-TierLockout.ps1        recovery from a logon lockout
 config/tiermodel.json         your configuration — the source of truth
 config/roles.example.json     ready-made DNS and Group Policy roles to copy in

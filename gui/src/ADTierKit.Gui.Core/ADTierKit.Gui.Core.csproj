@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Everything the window decides that can be decided without a window: the command line,
+       the configuration summary, the run safeguards. Plain net10.0, so the tests run anywhere. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>ADTierKit.Gui.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ADTierKit.Gui.Core.Tests" />
+  </ItemGroup>
+
+</Project>

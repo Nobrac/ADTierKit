@@ -16,3 +16,11 @@ config/tiermodel.json.*.bak
 .idea/
 Thumbs.db
 desktop.ini
+
+# .NET build output of the GUI
+gui/**/bin/
+gui/**/obj/
+gui/**/TestResults/
+gui/publish/
+.vs/
+*.user

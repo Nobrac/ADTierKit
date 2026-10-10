@@ -83,3 +83,24 @@ jobs:
           $PSVersionTable.PSVersion
           .\tests\Invoke-AllTests.ps1
           exit $LASTEXITCODE
+
+  gui:
+    # The WPF front end: build, unit tests (they also check the window against ADTierKit.ps1's
+    # parameters and run the real invocation against a stand-in script), and the published exe.
+    name: GUI (.NET 10)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build
+        run: dotnet build gui/ADTierKit.Gui.slnx -c Release
+      - name: Test
+        run: dotnet test gui/ADTierKit.Gui.slnx -c Release --no-build
+      - name: Publish
+        run: dotnet publish gui/src/ADTierKit.Gui -c Release -r win-x64 -o gui/publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ADTierKit.Gui
+          path: gui/publish/ADTierKit.Gui.exe
