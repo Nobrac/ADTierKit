@@ -1,0 +1,202 @@
+<Window x:Class="ADTierKit.Gui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:ADTierKit.Gui.ViewModels"
+        Title="ADTierKit" Width="1240" Height="860" MinWidth="1000" MinHeight="640"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13"
+        Background="{StaticResource Canvas}"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+
+  <DockPanel>
+    <!-- header -->
+    <Border DockPanel.Dock="Top" Background="{StaticResource Header}" Padding="18,12">
+      <DockPanel>
+        <Border DockPanel.Dock="Right" VerticalAlignment="Center" CornerRadius="12" Padding="12,4">
+          <Border.Style>
+            <Style TargetType="Border">
+              <Setter Property="Background" Value="{StaticResource Danger}"/>
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding IsElevated}" Value="True">
+                  <Setter Property="Background" Value="#1A7F37"/>
+                </DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </Border.Style>
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="{Binding ElevationText}" Foreground="White" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <Button Content="Restart elevated" Margin="10,0,0,0" Padding="8,1" MinWidth="0"
+                    Command="{Binding RestartElevatedCommand}"
+                    Visibility="{Binding IsElevated, Converter={StaticResource Visible}, ConverterParameter=Invert}"/>
+          </StackPanel>
+        </Border>
+        <StackPanel>
+          <TextBlock Text="ADTierKit" Foreground="White" FontSize="20" FontWeight="SemiBold"/>
+          <TextBlock Text="{Binding ScriptInfoText}" Foreground="#AFB8C1" TextTrimming="CharacterEllipsis"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- status bar -->
+    <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface}" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0" Padding="14,6">
+      <DockPanel>
+        <TextBlock DockPanel.Dock="Right" Text="{Binding ExitText}" FontWeight="SemiBold"
+                   Foreground="{Binding ExitKind, Converter={StaticResource LineBrush}}"/>
+        <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource Muted}"/>
+      </DockPanel>
+    </Border>
+
+    <Grid Margin="14">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="440"/>
+        <ColumnDefinition Width="14"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+
+      <!-- left: choices -->
+      <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" IsEnabled="{Binding IsRunning, Converter={StaticResource Not}}">
+        <StackPanel>
+
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <TextBlock Style="{StaticResource CardTitle}" Text="Configuration"/>
+              <TextBlock Text="Script" Margin="0,0,0,2"/>
+              <DockPanel Margin="0,0,0,8">
+                <Button DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0" Command="{Binding BrowseScriptCommand}"/>
+                <TextBox Text="{Binding ScriptPath, UpdateSourceTrigger=LostFocus}"/>
+              </DockPanel>
+              <TextBlock Text="Configuration file" Margin="0,0,0,2"/>
+              <DockPanel>
+                <Button DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0" Command="{Binding BrowseConfigurationCommand}"/>
+                <TextBox Text="{Binding ConfigurationPath, UpdateSourceTrigger=LostFocus}"/>
+              </DockPanel>
+              <TextBlock Text="{Binding ConfigurationText}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+              <Border Background="#FFF8C5" BorderBrush="#D4A72C" BorderThickness="1" CornerRadius="4" Padding="8,6" Margin="0,8,0,0"
+                      Visibility="{Binding HasConfigurationWarnings, Converter={StaticResource Visible}}">
+                <TextBlock Text="{Binding ConfigurationWarnings}" TextWrapping="Wrap" Foreground="#7D4E00"/>
+              </Border>
+              <WrapPanel Margin="0,10,0,0">
+                <Button Content="Start wizard" ToolTip="Opens the interactive wizard in its own console window" Command="{Binding StartWizardCommand}"/>
+                <Button Content="Open in editor" Command="{Binding EditConfigurationCommand}"/>
+                <Button Content="Reload" Command="{Binding ReloadConfigurationCommand}"/>
+              </WrapPanel>
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <TextBlock Style="{StaticResource CardTitle}" Text="Mode"/>
+              <RadioButton GroupName="Mode" Content="Check - prerequisites"
+                           IsChecked="{Binding Mode, Converter={StaticResource EnumEquals}, ConverterParameter=Check}"/>
+              <RadioButton GroupName="Mode" Content="Audit - read-only drift and attack path report"
+                           IsChecked="{Binding Mode, Converter={StaticResource EnumEquals}, ConverterParameter=Audit}"/>
+              <RadioButton GroupName="Mode" Content="Deploy - plan, or apply the configuration"
+                           IsChecked="{Binding Mode, Converter={StaticResource EnumEquals}, ConverterParameter=Deploy}"/>
+              <RadioButton GroupName="Mode" Content="Sync - membership, hygiene and silos (writes)"
+                           IsChecked="{Binding Mode, Converter={StaticResource EnumEquals}, ConverterParameter=Sync}"/>
+              <RadioButton GroupName="Mode" Content="Install task - daily Sync as SYSTEM"
+                           IsChecked="{Binding Mode, Converter={StaticResource EnumEquals}, ConverterParameter=InstallTask}"/>
+              <TextBlock Text="{Binding ModeDescription}" Style="{StaticResource Hint}" Margin="0,6,0,0"/>
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource Card}" Visibility="{Binding IsDeploy, Converter={StaticResource Visible}}">
+            <StackPanel>
+              <TextBlock Style="{StaticResource CardTitle}" Text="Deploy"/>
+              <DockPanel Margin="0,0,0,8">
+                <TextBlock Text="Preset" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <ComboBox ItemsSource="{Binding Presets}" SelectedItem="{Binding SelectedPreset}"/>
+              </DockPanel>
+              <ItemsControl ItemsSource="{Binding Stages}">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate>
+                    <UniformGrid Columns="3"/>
+                  </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate DataType="{x:Type vm:StageItem}">
+                    <CheckBox Content="{Binding Name}" IsChecked="{Binding IsSelected}" ToolTip="{Binding Description}"/>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <Separator Margin="0,8"/>
+              <CheckBox IsChecked="{Binding Apply}" FontWeight="SemiBold" Content="Apply - write to Active Directory (otherwise plan only)"/>
+              <CheckBox IsChecked="{Binding Force}" Content="-Force: override the lockout guard and armoring check"/>
+              <CheckBox IsChecked="{Binding SkipPrerequisiteCheck}" Content="-SkipPrerequisiteCheck"/>
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource Card}" Visibility="{Binding IsInstallTask, Converter={StaticResource Visible}}">
+            <StackPanel>
+              <TextBlock Style="{StaticResource CardTitle}" Text="Scheduled task"/>
+              <CheckBox IsChecked="{Binding RequireSignedScript}" Content="-RequireSignedScript (AllSigned, publisher must be trusted)"/>
+              <CheckBox IsChecked="{Binding PinConfiguration}" Content="-PinConfiguration (refuse to run after the file changes)"/>
+            </StackPanel>
+          </Border>
+
+          <Expander Header="Advanced" Margin="0,0,0,10">
+            <Border Style="{StaticResource Card}" Margin="0,6,0,0">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="130"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Text="Domain controller" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="0" Grid.Column="1" Margin="0,2" Text="{Binding Server, UpdateSourceTrigger=PropertyChanged}" ToolTip="Empty: the PDC emulator"/>
+                <TextBlock Grid.Row="1" Text="Log directory" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="1" Grid.Column="1" Margin="0,2" Text="{Binding LogDirectory, UpdateSourceTrigger=PropertyChanged}" ToolTip="Empty: Logs next to the script"/>
+                <TextBlock Grid.Row="2" Text="Report directory" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="2" Grid.Column="1" Margin="0,2" Text="{Binding ReportDirectory, UpdateSourceTrigger=PropertyChanged}" ToolTip="Empty: Reports next to the script"/>
+                <TextBlock Grid.Row="3" Text="Credentials" VerticalAlignment="Center"/>
+                <TextBox Grid.Row="3" Grid.Column="1" Margin="0,2" Text="{Binding CredentialDirectory, UpdateSourceTrigger=PropertyChanged}" ToolTip="Deploy only. Empty: Credentials next to the script"/>
+                <CheckBox Grid.Row="4" Grid.Column="1" IsChecked="{Binding NoEventLog}" Content="-NoEventLog"/>
+              </Grid>
+            </Border>
+          </Expander>
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- right: command and output -->
+      <DockPanel Grid.Column="2">
+        <Border DockPanel.Dock="Top" Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Style="{StaticResource CardTitle}" Text="Command line - the same run from an elevated console"/>
+            <DockPanel>
+              <Button DockPanel.Dock="Right" Content="Copy" Margin="8,0,0,0" Command="{Binding CopyCommandLineCommand}"/>
+              <TextBox Text="{Binding CommandLine, Mode=OneWay}" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" TextWrapping="Wrap" Background="{StaticResource Canvas}"/>
+            </DockPanel>
+          </StackPanel>
+        </Border>
+
+        <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+          <Button Style="{StaticResource PrimaryButton}" Content="{Binding RunButtonText}" Command="{Binding RunCommand}"/>
+          <Button Content="Stop" Command="{Binding StopCommand}"/>
+          <Button Content="Open latest report" Command="{Binding OpenReportCommand}"/>
+          <Button Content="Open log folder" Command="{Binding OpenLogsCommand}"/>
+          <Button Content="Copy output" Command="{Binding CopyOutputCommand}"/>
+          <Button Content="Clear" Command="{Binding ClearOutputCommand}"/>
+        </WrapPanel>
+
+        <Border Style="{StaticResource Card}" Padding="0" Margin="0">
+          <ListBox x:Name="OutputList" ItemsSource="{Binding Output}" BorderThickness="0" Background="Transparent"
+                   FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                   ScrollViewer.HorizontalScrollBarVisibility="Auto" SelectionMode="Extended">
+            <ListBox.ItemContainerStyle>
+              <Style TargetType="ListBoxItem">
+                <Setter Property="Padding" Value="8,0"/>
+              </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+              <DataTemplate DataType="{x:Type vm:OutputLine}">
+                <TextBlock Text="{Binding Text}" Foreground="{Binding Kind, Converter={StaticResource LineBrush}}"/>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Border>
+      </DockPanel>
+    </Grid>
+  </DockPanel>
+</Window>

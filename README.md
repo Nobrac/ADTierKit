@@ -104,15 +104,18 @@ Upgrading an existing configuration: run `.\Update-TierConfiguration.ps1` first,
 
 ### Graphical front end
 
+`ADTierKit.Gui.exe` is a WPF application (C#, .NET 10) over the same script: pick the
+configuration, a mode and the stages, and it shows the exact `ADTierKit.ps1` command line it will
+run, streams the coloured output, and opens the report and the log folder. An apply asks you to
+plan the same stages first and spells out what `-Force` and the GPO stage mean before anything is
+written. The wizard still runs in a console window, started from the GUI.
+
 ```powershell
-.\ADTierKit-Gui.ps1
+dotnet publish gui\src\ADTierKit.Gui -c Release -r win-x64 -o .   # ADTierKit.Gui.exe next to ADTierKit.ps1
 ```
 
-A WPF window over the same script: pick the configuration, a mode and the stages, and it shows
-the exact `ADTierKit.ps1` command line it will run, streams the output, and opens the report and
-log folder. An apply asks you to plan the same stages first and spells out what `-Force` and the
-GPO stage mean before anything is written. The wizard still runs in a console window, started
-from the GUI. Details: [Guide](docs/GUIDE.md#graphical-front-end).
+Needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0); every CI run
+also publishes the exe as a build artifact. Details: [Guide](docs/GUIDE.md#graphical-front-end).
 
 ## Documentation
 

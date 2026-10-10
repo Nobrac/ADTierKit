@@ -46,10 +46,12 @@ graphical front end.
 
 ### Added
 
-- `ADTierKit-Gui.ps1`, a WPF front end for Check, Audit, Deploy, Sync and InstallTask. It shows
-  and runs the exact command line, streams the output, asks to plan before an apply and confirms
-  every write. See [Graphical front end](docs/GUIDE.md#graphical-front-end).
-- Offline test suites `Test-SecurityReview.ps1` and `Test-Gui.ps1`.
+- `ADTierKit.Gui.exe`, a WPF front end in C# on .NET 10 (`gui/`) for Check, Audit, Deploy, Sync
+  and InstallTask. It shows and runs the exact command line, streams the output, asks to plan
+  before an apply and confirms every write. See
+  [Graphical front end](docs/GUIDE.md#graphical-front-end). CI builds it, runs its unit tests
+  and publishes the exe as an artifact.
+- Offline test suite `Test-SecurityReview.ps1`.
 
 ## [1.2.0] — 2026-09-25
 
