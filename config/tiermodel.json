@@ -315,7 +315,7 @@
               "valueName": "RunAsPPL",
               "type": "DWord",
               "value": 1,
-              "comment": "LSA protected process"
+              "comment": "LSA protected process. Value 1 sets the UEFI lock - removing the GPO does not turn it off, the LSA Protected Process Opt-out tool does. Value 2 (Windows 11 22H2 / Server 2025 and later) has no UEFI lock."
             },
             {
               "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Kerberos\\Parameters",

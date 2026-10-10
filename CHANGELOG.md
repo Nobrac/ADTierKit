@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Security review against Microsoft's tier model guidance and the BloodHound edge catalogue, and a
+graphical front end.
+
+### Security
+
+- **Objects squatted under a configured name are no longer adopted.** Groups, accounts and GPO
+  exception groups are found by name, and the names are predictable. A lower tier administrator
+  who can create objects in their own branch could create `G-T0-Admins` (or a template account)
+  first; deploy then moved it into Tier 0, nested it into Domain Admins or granted it the Tier 0
+  delegations, while its creator stayed the owner with `WRITE_DAC`. An existing object with a
+  configured name is now adopted only when it is owned by Domain Admins, Enterprise Admins,
+  Administrators, SYSTEM or an owner from the `ownership` block; anything else is refused with a
+  High finding and receives no membership, delegation or right.
+- **The wizard no longer deploys with `-Force`.** Its "structure" and "full" choices bypassed the
+  logon lockout guard and the Kerberos armoring prerequisite.
+- **The privileged group guard works on the group's real SID.** The "never empty Domain Admins"
+  guard only recognised the literal entry `512`; a full SID let `Enforce` empty the group. The
+  operator's own group memberships are no longer removed in `Enforce` mode.
+- **The isolation check no longer trusts everything in `CN=Users`.** Only built-in principals and
+  objects under the Tier 0 branch are exempt.
+- **More attack paths into Tier 0 are reported:** `AddSelf` (validated write to `member`),
+  `WriteAccountRestrictions` / `msDS-AllowedToActOnBehalfOfOtherIdentity` (RBCD),
+  `msDS-GroupMSAMembership` and `DS-Replication-Get-Changes-In-Filtered-Set`.
+- **The staging join group is not treated as Tier 0** by the attack path checks.
+- **SYSVOL is written on the same domain controller as the directory** (`-Server`, otherwise the
+  PDC emulator) instead of through the `\\domain` DFS path, so a new GPO's files and its AD
+  object cannot land on different DCs.
+- **The scheduled task ACL check covers every ancestor directory**, not just the direct parents.
+- **Configuration values are escaped** in LDAP filters and `-Filter` strings, and the name
+  fallback of principal resolution accepts exactly one security principal.
+
+### Fixed
+
+- The lockout guard reports an unreadable deny group membership instead of treating it as empty.
+- The wizard preview shows the silos from `authenticationPolicySilos` and the real deny logon
+  group; the wizard no longer refers to a `Deploy-TierModel.ps1` that does not exist.
+- The `RunAsPPL` comments say what the values do: `1` sets the UEFI lock, `2` does not.
+
+### Added
+
+- `ADTierKit-Gui.ps1`, a WPF front end for Check, Audit, Deploy, Sync and InstallTask. It shows
+  and runs the exact command line, streams the output, asks to plan before an apply and confirms
+  every write. See [Graphical front end](docs/GUIDE.md#graphical-front-end).
+- Offline test suites `Test-SecurityReview.ps1` and `Test-Gui.ps1`.
+
 ## [1.2.0] — 2026-09-25
 
 Review and hardening release. It closes gaps in the tier boundary itself, makes the audit and the
