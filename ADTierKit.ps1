@@ -40,7 +40,7 @@
     Continues even if the prerequisite check reports findings, and skips the safety questions.
 
     .NOTES
-    Version:  1.2.0
+    Version:  1.3.0
     License:  MIT
     Requires: Windows PowerShell 5.1, ActiveDirectory and GroupPolicy modules, Domain Admin.
 
@@ -189,7 +189,7 @@ Import-Module GroupPolicy -ErrorAction Stop
 #  Logging, configuration loading, runtime context and name resolution.
 ####################################################################################################
 
-$script:TierKitVersion = '1.2.0'
+$script:TierKitVersion = '1.3.0'
 $script:TierLogFile = $null
 $script:TierActions = [System.Collections.Generic.List[object]]::new()
 $script:TierContext = $null
