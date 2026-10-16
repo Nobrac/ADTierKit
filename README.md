@@ -1,78 +1,57 @@
 <div align="center">
 
-# 🏛️ ADTierKit
+# ADTierKit
 
-**Deploy, audit and maintain an Active Directory tier model — from one script and one JSON file.**
-
-<br>
+Deploy, audit and maintain an Active Directory tier model from one script and one JSON file.
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](docs/GUIDE.md#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2012R2%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](docs/GUIDE.md#prerequisites)
 [![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)](docs/GUIDE.md#limitations--notes)
 [![License](https://img.shields.io/badge/license-MIT-555555?style=for-the-badge)](LICENSE)
 
-<br>
-
-[**Quick start**](#quick-start) &nbsp;·&nbsp;
-[**Guide**](docs/GUIDE.md) &nbsp;·&nbsp;
-[**Operator's Guide**](docs/OPERATIONS.md) &nbsp;·&nbsp;
-[**Changelog**](CHANGELOG.md)
-
 </div>
 
-<br>
-
-```
-   wizard  ──▶   config/tiermodel.json   ◀── the source of truth
-                   │         │         │
-            deploy │   audit │    sync │
-                   ▼         ▼         ▼
-             converges   reports   keeps membership
-           the directory  drift       current
-```
-
-A guided wizard asks for your naming convention, previews every object it would create and writes
-one configuration file. From then on that file is the source of truth: **Deploy** converges the
-directory to it, **Audit** reports every drift, **Sync** keeps memberships current. Everything is
-idempotent, and nothing is written without a plan first. One PowerShell script, one JSON file - no
-module, no build step.
+A wizard asks for your naming convention, previews every object it would create and writes
+`config/tiermodel.json`. That file is the source of truth from then on. Deploy converges the
+directory to it, Audit reports drift, and Sync keeps memberships current. Every mode is idempotent
+and Deploy only plans unless you pass `-Apply`. It is one PowerShell script with no module and no
+build step.
 
 <div align="center">
   <a href="docs/deployment.png"><img src="docs/deployment.png" alt="A deployment run: prerequisite check, OU structure and domain wide settings" width="700"></a>
 </div>
 
 > [!CAUTION]
-> **Logon rights are tattooed.** Disabling a GPO link does not give a removed logon right back.
+> Logon rights are tattooed: disabling a GPO link does not give a removed logon right back.
 > Never enable the logon restrictions on a domain controller without a second way in (console,
 > another machine, DSRM). [`Repair-TierLockout.ps1`](docs/GUIDE.md#when-it-goes-wrong) is the way back.
 
 > [!WARNING]
-> **Lab-tested, not production-tested.** Run end to end against a Windows Server 2025 lab domain,
-> never against a production directory. Take a system state backup of a DC before the first
-> enforced deployment.
+> ADTierKit has been run end to end against a Windows Server 2025 lab domain, never against a
+> production directory. Take a system state backup of a DC before the first enforced deployment.
 
 > [!NOTE]
-> **Built with AI assistance.** Requirements defined and reviewed by a human, most of the code and
-> documentation written by an AI model. Review it before running it in production.
+> A human defined and reviewed the requirements; an AI model wrote most of the code and
+> documentation. Review it before running it in production.
 
 ## What it does
 
-- **Structure** - a tier OU tree, AGDLP groups, template and break-glass accounts, and delegation
+- Structure: a tier OU tree, AGDLP groups, template and break-glass accounts, and delegation
   that lets each tier administer only its own branch (no `WriteDacl`, no `WriteOwner`).
-- **Isolation** - per-tier logon restriction GPOs, a Domain Controller baseline, Kerberos
-  authentication policy silos and a neutral staging OU for machines not yet classified.
-- **Hardening** - Windows LAPS (DSRM included), `MachineAccountQuota`, Recycle Bin, KDS root key,
+- Isolation: per-tier logon restriction GPOs, a Domain Controller baseline, Kerberos
+  authentication policy silos and a neutral staging OU for unclassified machines.
+- Hardening: Windows LAPS (DSRM included), `MachineAccountQuota`, Recycle Bin, KDS root key,
   SACL auditing, Kerberos armoring.
-- **Audit** - privileged group membership, object ownership, undeclared access group members,
-  and the attack paths into Tier 0: DCSync rights, dangerous ACEs, editable Tier 0 GPOs, RBCD,
-  Kerberoastable admins, krbtgt age.
-- **Upkeep** - a daily sync task (optionally signed and configuration-pinned), run-over-run
-  reports that show what is new, and a lockout recovery script.
+- Audit: privileged group membership, object ownership, undeclared access group members,
+  and attack paths into Tier 0 (DCSync rights, dangerous ACEs, editable Tier 0 GPOs, RBCD,
+  Kerberoastable admins, krbtgt age).
+- Upkeep: a daily sync task (optionally signed and configuration-pinned), reports that show what
+  changed since the last run, and a lockout recovery script.
 
 ## Quick start
 
-Requires domain functional level 2012 R2+ (2016+ recommended), the `ActiveDirectory` and
-`GroupPolicy` modules and an elevated session as Domain Admin.
+You need domain functional level 2012 R2 or later (2016+ recommended), the `ActiveDirectory` and
+`GroupPolicy` modules, and an elevated session as Domain Admin.
 
 ```powershell
 Get-ChildItem C:\ADTierKit -Recurse | Unblock-File
@@ -89,41 +68,40 @@ cd C:\ADTierKit
 .\ADTierKit.ps1 -Mode InstallTask                 # daily Sync as SYSTEM
 ```
 
-Upgrading an existing configuration: run `.\Update-TierConfiguration.ps1` first, then plan a deploy.
+To upgrade an existing configuration, run `.\Update-TierConfiguration.ps1` first, then plan a deploy.
 
 | Mode | Writes | Purpose |
 | --- | :---: | --- |
-| *(none)* | ⚠️ | Interactive wizard - start here |
-| `Deploy` | ⚠️ | Converges the directory. Plans by default, writes only with `-Apply` |
-| `Audit` | — | Read-only drift, hygiene and attack path report |
-| `Sync` | ✅ | Membership, account hygiene and silo assignment - safe to schedule |
-| `InstallTask` | ✅ | Registers the daily Sync task |
-| `Check` | — | Prerequisite check |
+| *(none)* | yes | Interactive wizard, start here |
+| `Deploy` | with `-Apply` | Converges the directory; plans by default |
+| `Audit` | no | Drift, hygiene and attack path report |
+| `Sync` | yes | Membership, account hygiene and silo assignment; safe to schedule |
+| `InstallTask` | yes | Registers the daily Sync task |
+| `Check` | no | Prerequisite check |
 
-⚠️ only with `-Apply` · ✅ writes · — read-only. Exit codes and every option: see the [Guide](docs/GUIDE.md#modes).
+Exit codes and all options are in the [Guide](docs/GUIDE.md#modes).
 
-### Graphical front end
+### GUI
 
-`ADTierKit.Gui.exe` is a WPF application (C#, .NET 10) over the same script: pick the
-configuration, a mode and the stages, and it shows the exact `ADTierKit.ps1` command line it will
-run, streams the coloured output, and opens the report and the log folder. An apply asks you to
-plan the same stages first and spells out what `-Force` and the GPO stage mean before anything is
-written. The wizard still runs in a console window, started from the GUI.
+`ADTierKit.Gui.exe` is a WPF front end (C#, .NET 10) for the same script. It shows the exact
+`ADTierKit.ps1` command line before running it, streams the output and opens the report and log
+folder. Before an apply it makes you plan the same stages first. The wizard still opens in a
+console window.
 
 ```powershell
 dotnet publish gui\src\ADTierKit.Gui -c Release -r win-x64 -o .   # ADTierKit.Gui.exe next to ADTierKit.ps1
 ```
 
-Needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0); every CI run
-also publishes the exe as a build artifact. Details: [Guide](docs/GUIDE.md#graphical-front-end).
+It needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0). Each CI
+run also publishes the exe as a build artifact. See the [Guide](docs/GUIDE.md#graphical-front-end).
 
 ## Documentation
 
-| | |
-| --- | --- |
-| **[Guide](docs/GUIDE.md)** | The complete reference - what gets deployed, roles, ownership, guardrails, configuration, reports, troubleshooting, recovery |
-| **[Operator's Guide](docs/OPERATIONS.md)** | The walkthrough - every setting the tool writes, day-to-day work, the rollout playbook |
-| **[Changelog](CHANGELOG.md)** | What changed in each release |
+- [Guide](docs/GUIDE.md): full reference (what gets deployed, roles, ownership, guardrails,
+  configuration, reports, troubleshooting, recovery)
+- [Operator's Guide](docs/OPERATIONS.md): every setting the tool writes, day-to-day work and the
+  rollout playbook
+- [Changelog](CHANGELOG.md)
 
 ## License
 
